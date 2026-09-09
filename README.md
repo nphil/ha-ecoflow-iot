@@ -495,13 +495,14 @@ device ──BLE notify (held link)──▶ decoded frame ──▶ entities (a
    └────────── BLE write, one command at a time ◀─────────┘
 ```
 
-- Reads: the device pushes its display and runtime property frames; each frame updates the
-  device object and publishes exactly one coordinator update, however many properties it
-  carried.
-- Writes: serialised, one command at a time. The protocol carries no request ids, so two
-  commands in flight could have their replies attributed to each other. Nothing is
-  reported optimistically — an entity changes when the device pushes the new value back,
-  and a value the device refuses surfaces as an error instead of a state that never took.
+- Reads: the device pushes display and runtime property frames. Changed values feed the
+  coordinator; the Update interval option (default 10 seconds, 0 for no rate limit)
+  coalesces publications, with a trailing update so the final value is not lost.
+- Writes: serialised, one command at a time. A successful Bluetooth write confirms
+  transport submission, not necessarily that the device accepted or applied the setting.
+  Some vendored climate setters reflect the requested value after the write; subsequent
+  device reports remain authoritative. This is not a universal device-acknowledgement
+  guarantee, and physical Wave 3 control acceptance has not yet been verified.
 
 ## Connection resilience, cloud entries (MQTT down → HTTP → auto-recover)
 
