@@ -27,6 +27,7 @@ from .const import (
     CONF_MQTT_STALE_SECONDS,
     CONF_REGION,
     CONF_SECRET_KEY,
+    CONF_TRANSPORT,
     DEFAULT_ENABLE_MQTT,
     DEFAULT_MQTT_INSECURE_TLS,
     DEFAULT_MQTT_REFRESH_INTERVAL,
@@ -34,6 +35,7 @@ from .const import (
     DEFAULT_POLL_INTERVAL,
     DEFAULT_REGION,
     DOMAIN,
+    TRANSPORT_BLE,
 )
 from .coordinator import EcoFlowCoordinator
 
@@ -53,8 +55,24 @@ PLATFORMS: list[Platform] = [
 type EcoFlowConfigEntry = ConfigEntry[EcoFlowCoordinator]
 
 
+def is_ble_entry(entry: ConfigEntry) -> bool:
+    """Whether this entry is served by the local Bluetooth transport.
+
+    Entries created before local Bluetooth existed carry no transport at all,
+    which is why the cloud path is the absence of a marker rather than its own.
+    """
+    return entry.data.get(CONF_TRANSPORT) == TRANSPORT_BLE
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
     """Set up EcoFlow IoT from a config entry."""
+    if is_ble_entry(entry):
+        # Imported here so a cloud-only installation never loads the Bluetooth
+        # stack, and so a broken protocol import cannot take the cloud down.
+        from . import ble  # noqa: PLC0415
+
+        return await ble.async_setup_entry(hass, entry)
+
     await _async_register_card(hass)
 
     session = async_get_clientsession(hass)
@@ -94,10 +112,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> b
 
 async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
     """Unload a config entry."""
+    if is_ble_entry(entry):
+        from . import ble  # noqa: PLC0415
+
+        return await ble.async_unload_entry(hass, entry)
+
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         await entry.runtime_data.async_shutdown()
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> None:
+    """Clean up anything an entry left outside its own runtime data."""
+    if is_ble_entry(entry):
+        from . import ble  # noqa: PLC0415
+
+        await ble.async_remove_entry(hass, entry)
 
 
 async def _async_reload_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> None:

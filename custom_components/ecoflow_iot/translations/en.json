@@ -9,6 +9,14 @@
     "step": {
       "user": {
         "title": "EcoFlow IoT",
+        "description": "Add an EcoFlow account through the cloud API, or a single device over Bluetooth.",
+        "menu_options": {
+          "cloud": "EcoFlow account (cloud API)",
+          "pick_device": "Bluetooth device"
+        }
+      },
+      "cloud": {
+        "title": "EcoFlow IoT",
         "description": "Enter the Access Key and Secret Key from the EcoFlow developer portal (developer.ecoflow.com → Security).",
         "data": {
           "region": "Region",
@@ -24,16 +32,63 @@
           "access_key": "Access Key",
           "secret_key": "Secret Key"
         }
+      },
+      "pick_device": {
+        "title": "Choose an EcoFlow device",
+        "description": "Only supported devices currently being heard over Bluetooth are listed. If yours is missing, wake it up or move it closer to a Bluetooth proxy and try again — these devices advertise only every few seconds.",
+        "data": {
+          "address": "Device"
+        }
+      },
+      "bluetooth_confirm": {
+        "title": "Add {name}",
+        "description": "Add the {model} {name} ({address}) over Bluetooth? Home Assistant will hold a connection to it for as long as the device is configured.",
+        "data": {
+          "device_name": "Name"
+        },
+        "data_description": {
+          "device_name": "The name this device is given in Home Assistant. Entity ids are built from it the moment entities are created, so setting it now avoids renaming everything later - e.g. “Office River 3 Pro”."
+        }
+      },
+      "credentials": {
+        "title": "EcoFlow account",
+        "description": "{name} encrypts its Bluetooth link with the user ID of the EcoFlow account it is registered to. Enter that ID if you know it, or leave it blank and sign in below to look it up once.",
+        "data": {
+          "user_id": "User ID",
+          "email": "E-mail address or phone number",
+          "password": "Password",
+          "login_region": "Account region"
+        },
+        "data_description": {
+          "user_id": "The 19-digit ID of your EcoFlow account. It is reused for every Bluetooth device you add, so you are only asked once.",
+          "email": "Only used to look the user ID up. Leave blank if you entered the ID above.",
+          "password": "Sent once to EcoFlow to fetch the user ID, then discarded. It is never stored.",
+          "login_region": "Which EcoFlow server your account lives on. Leave on automatic unless the sign-in fails."
+        }
+      },
+      "reauth_ble": {
+        "title": "Re-authenticate {name}",
+        "description": "{name} rejected the stored EcoFlow user ID. Enter it again, or sign in to look it up.",
+        "data": {
+          "user_id": "User ID",
+          "email": "E-mail address or phone number",
+          "password": "Password",
+          "login_region": "Account region"
+        }
       }
     },
     "error": {
       "invalid_auth": "Invalid Access Key or Secret Key.",
       "cannot_connect": "Failed to connect to the EcoFlow API.",
-      "unknown": "Unexpected error."
+      "unknown": "Unexpected error.",
+      "invalid_user_id": "The user ID must be the digits shown by the EcoFlow account, with nothing else.",
+      "user_id_required": "Enter a user ID, or an e-mail address and password to look one up."
     },
     "abort": {
-      "already_configured": "These credentials are already configured.",
-      "reauth_successful": "Re-authentication was successful."
+      "already_configured": "This EcoFlow account or device is already configured.",
+      "reauth_successful": "Re-authentication was successful.",
+      "not_supported": "That Bluetooth device is not an EcoFlow model this integration supports.",
+      "no_devices_found": "No supported EcoFlow devices are currently being heard over Bluetooth."
     }
   },
   "options": {
@@ -57,6 +112,15 @@
           "invert_grid_sign": "Some Stream units report grid power with the sign inverted — they show power fed into the grid as positive instead of negative, the opposite of Home Assistant's convention. This depends on the model and firmware, so it can't be detected automatically. Leave this on (the default) and the sign is corrected: Grid power reads negative while you export, and the Grid import / export energy sensors count in the right direction. Turn it off only if your unit already matches Home Assistant — i.e. exporting to the grid already shows Grid power as negative (import positive, export negative). If you change this setting, also tick \"Reset grid import/export energy totals\" below — the existing totals were built up in the wrong direction and won't correct themselves.",
           "reset_grid_energy": "One-shot action: tick this and save to fully reset the Grid import energy and Grid export energy sensors. It zeroes the live counters and deletes their recorded history and Energy Dashboard statistics, so the old wrong-direction data is gone and they start fresh from zero. Recommended after changing the sign setting above. Leave it off for normal use."
         }
+      },
+      "ble_options": {
+        "title": "Bluetooth device options",
+        "data": {
+          "update_period": "Update interval (seconds)"
+        },
+        "data_description": {
+          "update_period": "How often the device is asked to report its values over the held Bluetooth connection. Lower is more responsive and uses slightly more airtime; the connection itself is held regardless."
+        }
       }
     }
   },
@@ -78,115 +142,501 @@
           "unknown": "Unknown"
         }
       },
-      "cms_batt_soc": { "name": "Battery" },
-      "bat_power": { "name": "Battery power" },
-      "pv_total": { "name": "Solar power" },
-      "grid_power": { "name": "Grid power" },
-      "solar_energy": { "name": "Solar energy" },
-      "pv1_power": { "name": "Solar string 1 power" },
-      "pv2_power": { "name": "Solar string 2 power" },
-      "pv3_power": { "name": "Solar string 3 power" },
-      "pv4_power": { "name": "Solar string 4 power" },
-      "schuko1_power": { "name": "AC socket 1 power" },
-      "schuko2_power": { "name": "AC socket 2 power" },
-      "schuko1_inverter_power": { "name": "AC socket 1 inverter power" },
-      "schuko2_inverter_power": { "name": "AC socket 2 inverter power" },
-      "soh": { "name": "Battery health" },
-      "bat_temp": { "name": "Battery temperature" },
-      "chg_rem_time": { "name": "Time to full" },
-      "dsg_rem_time": { "name": "Time to empty" },
-      "full_energy": { "name": "Battery capacity" },
-      "cycles": { "name": "Battery cycles" },
-      "bms_batt_soc": { "name": "Battery (BMS)" },
-      "f32_show_soc": { "name": "Battery (precise)" },
-      "bat_vol": { "name": "Battery voltage" },
-      "bat_amp": { "name": "Battery current" },
-      "accu_chg_energy": { "name": "Total charged" },
-      "accu_dsg_energy": { "name": "Total discharged" },
-      "cell_vol_delta": { "name": "Cell voltage delta" },
-      "mos_temp": { "name": "MOSFET temperature" },
-      "max_cell_temp": { "name": "Battery max cell temperature" },
-      "min_cell_temp": { "name": "Battery min cell temperature" },
-      "sys_load": { "name": "Load power" },
-      "load_from_bat": { "name": "Load from battery" },
-      "load_from_grid": { "name": "Load from grid" },
-      "load_from_pv": { "name": "Load from solar" },
-      "sys_grid_power": { "name": "System grid power" },
-      "grid_voltage": { "name": "Grid voltage" },
-      "grid_freq": { "name": "Grid frequency" },
-      "inv_temp": { "name": "Inverter temperature" },
-      "ac_total_power": { "name": "Total AC power" },
-      "grid_connection_status": { "name": "Grid connection status" },
-      "meter_phase_a": { "name": "Meter phase A power" },
-      "pv1_voltage": { "name": "Solar string 1 voltage" },
-      "pv2_voltage": { "name": "Solar string 2 voltage" },
-      "pv3_voltage": { "name": "Solar string 3 voltage" },
-      "pv4_voltage": { "name": "Solar string 4 voltage" },
-      "pv1_current": { "name": "Solar string 1 current" },
-      "pv2_current": { "name": "Solar string 2 current" },
-      "pv3_current": { "name": "Solar string 3 current" },
-      "pv4_current": { "name": "Solar string 4 current" },
-      "grid_import_energy": { "name": "Grid import energy" },
-      "grid_export_energy": { "name": "Grid export energy" },
-      "battery_charge_energy": { "name": "Battery charge energy" },
-      "battery_discharge_energy": { "name": "Battery discharge energy" },
-      "schuko1_energy": { "name": "AC socket 1 energy" },
-      "schuko2_energy": { "name": "AC socket 2 energy" },
-      "wifi_rssi": { "name": "Wi-Fi signal" },
-      "feed_grid_limit": { "name": "Feed-in power limit" },
-      "grid_in_power_limit": { "name": "Grid input power limit" },
-      "busbar_power_limit": { "name": "Busbar power limit" },
-      "calendar_soh": { "name": "Battery calendar health" },
-      "cycle_soh": { "name": "Battery cycle health" },
-      "max_cell_vol": { "name": "Battery max cell voltage" },
-      "min_cell_vol": { "name": "Battery min cell voltage" },
-      "heater_temp": { "name": "Battery heater temperature" },
-      "avail_charge_power": { "name": "Available charge power" },
-      "ai_tou_target_soc": { "name": "AI target charge level" },
-      "ac_standby_time": { "name": "AC standby timeout" },
-      "grid_code": { "name": "Grid code" },
-      "device_role": { "name": "Device role" },
-      "local_meter_power": { "name": "Local meter power" },
-      "local_meter_import_energy": { "name": "Local meter import energy" },
-      "local_meter_export_energy": { "name": "Local meter export energy" },
-      "local_meter_phase_a_power": { "name": "Local meter phase A power" },
-      "local_meter_phase_b_power": { "name": "Local meter phase B power" },
-      "local_meter_phase_c_power": { "name": "Local meter phase C power" },
-      "local_meter_phase_a_voltage": { "name": "Local meter phase A voltage" },
-      "local_meter_phase_b_voltage": { "name": "Local meter phase B voltage" },
-      "local_meter_phase_c_voltage": { "name": "Local meter phase C voltage" },
-      "local_meter_phase_a_current": { "name": "Local meter phase A current" },
-      "local_meter_phase_b_current": { "name": "Local meter phase B current" },
-      "local_meter_phase_c_current": { "name": "Local meter phase C current" }
+      "cms_batt_soc": {
+        "name": "Battery"
+      },
+      "bat_power": {
+        "name": "Battery power"
+      },
+      "pv_total": {
+        "name": "Solar power"
+      },
+      "grid_power": {
+        "name": "Grid power"
+      },
+      "solar_energy": {
+        "name": "Solar energy"
+      },
+      "pv1_power": {
+        "name": "Solar string 1 power"
+      },
+      "pv2_power": {
+        "name": "Solar string 2 power"
+      },
+      "pv3_power": {
+        "name": "Solar string 3 power"
+      },
+      "pv4_power": {
+        "name": "Solar string 4 power"
+      },
+      "schuko1_power": {
+        "name": "AC socket 1 power"
+      },
+      "schuko2_power": {
+        "name": "AC socket 2 power"
+      },
+      "schuko1_inverter_power": {
+        "name": "AC socket 1 inverter power"
+      },
+      "schuko2_inverter_power": {
+        "name": "AC socket 2 inverter power"
+      },
+      "soh": {
+        "name": "Battery health"
+      },
+      "bat_temp": {
+        "name": "Battery temperature"
+      },
+      "chg_rem_time": {
+        "name": "Time to full"
+      },
+      "dsg_rem_time": {
+        "name": "Time to empty"
+      },
+      "full_energy": {
+        "name": "Battery capacity"
+      },
+      "cycles": {
+        "name": "Battery cycles"
+      },
+      "bms_batt_soc": {
+        "name": "Battery (BMS)"
+      },
+      "f32_show_soc": {
+        "name": "Battery (precise)"
+      },
+      "bat_vol": {
+        "name": "Battery voltage"
+      },
+      "bat_amp": {
+        "name": "Battery current"
+      },
+      "accu_chg_energy": {
+        "name": "Total charged"
+      },
+      "accu_dsg_energy": {
+        "name": "Total discharged"
+      },
+      "cell_vol_delta": {
+        "name": "Cell voltage delta"
+      },
+      "mos_temp": {
+        "name": "MOSFET temperature"
+      },
+      "max_cell_temp": {
+        "name": "Battery max cell temperature"
+      },
+      "min_cell_temp": {
+        "name": "Battery min cell temperature"
+      },
+      "sys_load": {
+        "name": "Load power"
+      },
+      "load_from_bat": {
+        "name": "Load from battery"
+      },
+      "load_from_grid": {
+        "name": "Load from grid"
+      },
+      "load_from_pv": {
+        "name": "Load from solar"
+      },
+      "sys_grid_power": {
+        "name": "System grid power"
+      },
+      "grid_voltage": {
+        "name": "Grid voltage"
+      },
+      "grid_freq": {
+        "name": "Grid frequency"
+      },
+      "inv_temp": {
+        "name": "Inverter temperature"
+      },
+      "ac_total_power": {
+        "name": "Total AC power"
+      },
+      "grid_connection_status": {
+        "name": "Grid connection status"
+      },
+      "meter_phase_a": {
+        "name": "Meter phase A power"
+      },
+      "pv1_voltage": {
+        "name": "Solar string 1 voltage"
+      },
+      "pv2_voltage": {
+        "name": "Solar string 2 voltage"
+      },
+      "pv3_voltage": {
+        "name": "Solar string 3 voltage"
+      },
+      "pv4_voltage": {
+        "name": "Solar string 4 voltage"
+      },
+      "pv1_current": {
+        "name": "Solar string 1 current"
+      },
+      "pv2_current": {
+        "name": "Solar string 2 current"
+      },
+      "pv3_current": {
+        "name": "Solar string 3 current"
+      },
+      "pv4_current": {
+        "name": "Solar string 4 current"
+      },
+      "grid_import_energy": {
+        "name": "Grid import energy"
+      },
+      "grid_export_energy": {
+        "name": "Grid export energy"
+      },
+      "battery_charge_energy": {
+        "name": "Battery charge energy"
+      },
+      "battery_discharge_energy": {
+        "name": "Battery discharge energy"
+      },
+      "schuko1_energy": {
+        "name": "AC socket 1 energy"
+      },
+      "schuko2_energy": {
+        "name": "AC socket 2 energy"
+      },
+      "wifi_rssi": {
+        "name": "Wi-Fi signal"
+      },
+      "feed_grid_limit": {
+        "name": "Feed-in power limit"
+      },
+      "grid_in_power_limit": {
+        "name": "Grid input power limit"
+      },
+      "busbar_power_limit": {
+        "name": "Busbar power limit"
+      },
+      "calendar_soh": {
+        "name": "Battery calendar health"
+      },
+      "cycle_soh": {
+        "name": "Battery cycle health"
+      },
+      "max_cell_vol": {
+        "name": "Battery max cell voltage"
+      },
+      "min_cell_vol": {
+        "name": "Battery min cell voltage"
+      },
+      "heater_temp": {
+        "name": "Battery heater temperature"
+      },
+      "avail_charge_power": {
+        "name": "Available charge power"
+      },
+      "ai_tou_target_soc": {
+        "name": "AI target charge level"
+      },
+      "ac_standby_time": {
+        "name": "AC standby timeout"
+      },
+      "grid_code": {
+        "name": "Grid code"
+      },
+      "device_role": {
+        "name": "Device role"
+      },
+      "local_meter_power": {
+        "name": "Local meter power"
+      },
+      "local_meter_import_energy": {
+        "name": "Local meter import energy"
+      },
+      "local_meter_export_energy": {
+        "name": "Local meter export energy"
+      },
+      "local_meter_phase_a_power": {
+        "name": "Local meter phase A power"
+      },
+      "local_meter_phase_b_power": {
+        "name": "Local meter phase B power"
+      },
+      "local_meter_phase_c_power": {
+        "name": "Local meter phase C power"
+      },
+      "local_meter_phase_a_voltage": {
+        "name": "Local meter phase A voltage"
+      },
+      "local_meter_phase_b_voltage": {
+        "name": "Local meter phase B voltage"
+      },
+      "local_meter_phase_c_voltage": {
+        "name": "Local meter phase C voltage"
+      },
+      "local_meter_phase_a_current": {
+        "name": "Local meter phase A current"
+      },
+      "local_meter_phase_b_current": {
+        "name": "Local meter phase B current"
+      },
+      "local_meter_phase_c_current": {
+        "name": "Local meter phase C current"
+      },
+      "ble_connection": {
+        "name": "Connection"
+      },
+      "battery_level": {
+        "name": "Battery"
+      },
+      "battery_level_main": {
+        "name": "Main battery"
+      },
+      "cell_temperature": {
+        "name": "Cell temperature"
+      },
+      "input_power": {
+        "name": "Input power"
+      },
+      "output_power": {
+        "name": "Output power"
+      },
+      "ac_input_power": {
+        "name": "AC input power"
+      },
+      "ac_output_power": {
+        "name": "AC output power"
+      },
+      "dc_input_power": {
+        "name": "DC input power"
+      },
+      "dc12v_output_power": {
+        "name": "DC 12 V output power"
+      },
+      "usbc_output_power": {
+        "name": "USB-C output power"
+      },
+      "usba_output_power": {
+        "name": "USB-A output power"
+      },
+      "usbc2_output_power": {
+        "name": "USB-C 2 output power"
+      },
+      "usba2_output_power": {
+        "name": "USB-A 2 output power"
+      },
+      "dc2_input_power": {
+        "name": "DC input 2 power"
+      },
+      "dc24v_output_power": {
+        "name": "DC 24 V output power"
+      },
+      "battery_input_power": {
+        "name": "Battery input power"
+      },
+      "battery_output_power": {
+        "name": "Battery output power"
+      },
+      "battery_power": {
+        "name": "Battery power"
+      },
+      "max_ac_charging_power": {
+        "name": "Max AC charging power"
+      },
+      "remaining_time_charging": {
+        "name": "Time to full"
+      },
+      "remaining_time_discharging": {
+        "name": "Time to empty"
+      },
+      "input_energy": {
+        "name": "Input energy"
+      },
+      "output_energy": {
+        "name": "Output energy"
+      },
+      "ac_input_energy": {
+        "name": "AC input energy"
+      },
+      "ac_output_energy": {
+        "name": "AC output energy"
+      },
+      "dc_input_energy": {
+        "name": "DC input energy"
+      },
+      "dc12v_output_energy": {
+        "name": "DC 12 V output energy"
+      },
+      "usbc_output_energy": {
+        "name": "USB-C output energy"
+      },
+      "usba_output_energy": {
+        "name": "USB-A output energy"
+      },
+      "ambient_temperature": {
+        "name": "Ambient temperature"
+      },
+      "ambient_humidity": {
+        "name": "Ambient humidity"
+      },
+      "temp_indoor_supply_air": {
+        "name": "Supply air temperature"
+      },
+      "temp_indoor_return_air": {
+        "name": "Return air temperature"
+      },
+      "temp_outdoor_ambient": {
+        "name": "Outdoor temperature"
+      },
+      "temp_condenser": {
+        "name": "Condenser temperature"
+      },
+      "temp_evaporator": {
+        "name": "Evaporator temperature"
+      },
+      "temp_compressor_discharge": {
+        "name": "Compressor discharge temperature"
+      },
+      "condensate_water_level": {
+        "name": "Condensate water level"
+      },
+      "pcs_fan_level": {
+        "name": "Cooling fan level"
+      },
+      "drainage_mode": {
+        "name": "Drainage mode"
+      },
+      "battery_1_battery_level": {
+        "name": "Extra battery"
+      },
+      "battery_1_cell_temperature": {
+        "name": "Extra battery cell temperature"
+      },
+      "battery_1_sn": {
+        "name": "Extra battery serial number"
+      },
+      "sleep_state": {
+        "name": "Sleep state",
+        "state": {
+          "on": "On",
+          "standby": "Standby"
+        }
+      }
     },
     "binary_sensor": {
-      "batt_heating": { "name": "Battery heater" },
-      "has_meter": { "name": "Smart meter connected" },
-      "storm_guard": { "name": "Storm guard" },
-      "off_grid": { "name": "Off-grid mode" },
-      "water_ingress": { "name": "Water ingress" },
-      "problem": { "name": "Problem" },
-      "pv1_connected": { "name": "Solar string 1 connected" },
-      "pv2_connected": { "name": "Solar string 2 connected" },
-      "pv3_connected": { "name": "Solar string 3 connected" },
-      "pv4_connected": { "name": "Solar string 4 connected" },
-      "battery_charging": { "name": "Battery charging" }
+      "batt_heating": {
+        "name": "Battery heater"
+      },
+      "has_meter": {
+        "name": "Smart meter connected"
+      },
+      "storm_guard": {
+        "name": "Storm guard"
+      },
+      "off_grid": {
+        "name": "Off-grid mode"
+      },
+      "water_ingress": {
+        "name": "Water ingress"
+      },
+      "problem": {
+        "name": "Problem"
+      },
+      "pv1_connected": {
+        "name": "Solar string 1 connected"
+      },
+      "pv2_connected": {
+        "name": "Solar string 2 connected"
+      },
+      "pv3_connected": {
+        "name": "Solar string 3 connected"
+      },
+      "pv4_connected": {
+        "name": "Solar string 4 connected"
+      },
+      "battery_charging": {
+        "name": "Battery charging"
+      },
+      "pet_care_warning": {
+        "name": "Pet care warning"
+      },
+      "in_drainage": {
+        "name": "Draining"
+      },
+      "plugged_in_ac": {
+        "name": "AC connected"
+      },
+      "error_occurred": {
+        "name": "Error"
+      },
+      "fan_running": {
+        "name": "Fan running"
+      },
+      "battery_1_enabled": {
+        "name": "Extra battery connected"
+      }
     },
     "number": {
-      "max_charge_soc": { "name": "Charge limit" },
-      "min_discharge_soc": { "name": "Discharge limit" },
-      "feed_in_limit": { "name": "Feed-in power limit" },
-      "base_load": { "name": "Base load {window}" },
-      "backup_reserve": { "name": "Backup reserve" }
+      "max_charge_soc": {
+        "name": "Charge limit"
+      },
+      "min_discharge_soc": {
+        "name": "Discharge limit"
+      },
+      "feed_in_limit": {
+        "name": "Feed-in power limit"
+      },
+      "base_load": {
+        "name": "Base load {window}"
+      },
+      "backup_reserve": {
+        "name": "Backup reserve"
+      },
+      "battery_charge_limit_min": {
+        "name": "Discharge limit"
+      },
+      "battery_charge_limit_max": {
+        "name": "Charge limit"
+      },
+      "energy_backup_battery_level": {
+        "name": "Backup reserve level"
+      },
+      "ac_charging_speed": {
+        "name": "AC charging speed"
+      },
+      "dc_charging_max_amps": {
+        "name": "DC charging current limit"
+      }
     },
     "switch": {
-      "ac1": { "name": "AC socket 1" },
-      "self_powered": { "name": "Self-powered mode" },
-      "feed_in": { "name": "Grid feed-in" },
-      "ac2": { "name": "AC socket 2" }
+      "ac1": {
+        "name": "AC socket 1"
+      },
+      "self_powered": {
+        "name": "Self-powered mode"
+      },
+      "feed_in": {
+        "name": "Grid feed-in"
+      },
+      "ac2": {
+        "name": "AC socket 2"
+      },
+      "en_pet_care": {
+        "name": "Pet care"
+      },
+      "ac_ports": {
+        "name": "AC outlets"
+      },
+      "dc_12v_port": {
+        "name": "DC 12 V outlet"
+      },
+      "energy_backup": {
+        "name": "Energy backup"
+      }
     },
     "light": {
-      "led": { "name": "LED" }
+      "led": {
+        "name": "LED"
+      }
     },
     "select": {
       "operating_mode": {
@@ -197,7 +647,97 @@
           "time_of_use": "Time of use",
           "intelligent": "Intelligent"
         }
+      },
+      "dc_charging_type": {
+        "name": "DC input type",
+        "state": {
+          "auto": "Automatic",
+          "car": "Car",
+          "solar": "Solar"
+        }
+      },
+      "led_mode": {
+        "name": "LED",
+        "state": {
+          "off": "Off",
+          "dim": "Dim",
+          "bright": "Bright",
+          "sos": "SOS"
+        }
+      },
+      "temp_unit": {
+        "name": "Temperature unit",
+        "state": {
+          "celsius": "Celsius",
+          "fahrenheit": "Fahrenheit"
+        }
+      },
+      "lcd_show_temp_type": {
+        "name": "Display temperature",
+        "state": {
+          "ambient": "Ambient",
+          "supply_air": "Supply air"
+        }
       }
+    },
+    "button": {
+      "power_off": {
+        "name": "Power off"
+      }
+    },
+    "climate": {
+      "climate": {
+        "name": "Air conditioner",
+        "state_attributes": {
+          "fan_mode": {
+            "state": {
+              "low": "Low",
+              "medium_low": "Medium low",
+              "medium": "Medium",
+              "medium_high": "Medium high",
+              "high": "High"
+            }
+          },
+          "preset_mode": {
+            "state": {
+              "none": "None",
+              "normal": "Normal",
+              "max": "Max",
+              "sleep": "Sleep",
+              "eco": "Eco"
+            }
+          }
+        }
+      }
+    }
+  },
+  "exceptions": {
+    "not_connected": {
+      "message": "Cannot {name}: {device} is not connected over Bluetooth."
+    },
+    "command_failed": {
+      "message": "{name} failed: {error}"
+    },
+    "command_rejected": {
+      "message": "The device rejected {name}."
+    },
+    "device_not_present": {
+      "message": "No Bluetooth advertisement has been heard from {address} yet."
+    },
+    "not_supported": {
+      "message": "Device {serial} is not a model this integration supports over Bluetooth."
+    },
+    "authentication_failed": {
+      "message": "The device rejected the stored EcoFlow user ID: {error}"
+    },
+    "command_timeout": {
+      "message": "{name} timed out; the Bluetooth link was released and will be re-established."
+    },
+    "serial_mismatch": {
+      "message": "The device at {address} reports serial {found}, not the configured {expected}. Remove this entry and add the device again."
+    },
+    "user_id_missing": {
+      "message": "No EcoFlow account user ID is stored for this device; every Bluetooth session authenticates with one."
     }
   }
 }

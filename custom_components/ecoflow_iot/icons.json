@@ -1,0 +1,31 @@
+{
+  "entity": {
+    "sensor": {
+      "ble_connection": {
+        "default": "mdi:bluetooth-connect"
+      },
+      "drainage_mode": {
+        "default": "mdi:water-pump"
+      },
+      "pcs_fan_level": {
+        "default": "mdi:fan"
+      },
+      "battery_1_sn": {
+        "default": "mdi:identifier"
+      }
+    },
+    "select": {
+      "led_mode": {
+        "default": "mdi:led-on"
+      },
+      "dc_charging_type": {
+        "default": "mdi:solar-power-variant"
+      }
+    },
+    "button": {
+      "power_off": {
+        "default": "mdi:power"
+      }
+    }
+  }
+}

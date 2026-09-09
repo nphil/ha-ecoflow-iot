@@ -7,7 +7,7 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
-from . import EcoFlowConfigEntry
+from . import EcoFlowConfigEntry, is_ble_entry
 from .const import CONF_ACCESS_KEY, CONF_SECRET_KEY, SN_PREFIX_LEN
 
 TO_REDACT = {
@@ -21,6 +21,10 @@ TO_REDACT = {
     "scoket2BindDeviceSn",
     "snSuffix",
     "iotWifiBssid",
+    "user_id",
+    "address",
+    "serial",
+    "scanner_source",
 }
 
 
@@ -29,6 +33,18 @@ async def async_get_config_entry_diagnostics(
 ) -> dict[str, Any]:
     """Return redacted diagnostics for a config entry."""
     coordinator = entry.runtime_data
+    if is_ble_entry(entry):
+        # Never export pairing identity or proxy names containing MAC addresses.
+        return async_redact_data(
+            {
+                "transport": "ble",
+                "model": coordinator.model_name,
+                "connected": coordinator.connected,
+                "options": dict(entry.options),
+                "link": coordinator.link_attributes,
+            },
+            TO_REDACT,
+        )
     # Devices are keyed by SN prefix + counter, never the full serial.
     devices = {
         f"{sn[:SN_PREFIX_LEN]}-{index}": {

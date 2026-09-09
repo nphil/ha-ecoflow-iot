@@ -81,7 +81,17 @@ class EcoFlowError(Exception):
     """Stub API error."""
 
 
+class EcoFlowApiError(EcoFlowError):
+    """Stub business-code error, mirroring the real ``code``/``message`` pair."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(f"EcoFlow API error {code}: {message}")
+
+
 api.EcoFlowError = EcoFlowError
+api.EcoFlowApiError = EcoFlowApiError
 api.EcoFlowHttpClient = object
 api.EcoFlowMqttClient = object
 sys.modules["ecoflow_iot.api"] = api

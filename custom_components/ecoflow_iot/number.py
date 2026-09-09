@@ -7,7 +7,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from . import EcoFlowConfigEntry
+from . import EcoFlowConfigEntry, is_ble_entry
 from .devices.base import EcoFlowNumberEntityDescription
 from .entity import EcoFlowEntity
 
@@ -20,6 +20,12 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up EcoFlow numbers from a config entry."""
+    if is_ble_entry(entry):
+        from .ble.number import async_setup_entry as async_setup_ble_entry
+
+        await async_setup_ble_entry(hass, entry, async_add_entities)
+        return
+
     coordinator = entry.runtime_data
     entities: list[NumberEntity] = []
     for sn, device in coordinator.devices.items():

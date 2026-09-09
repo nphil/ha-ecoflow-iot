@@ -1,0 +1,177 @@
+EcoFlow local BLE protocol library (`eflib`) — vendored third-party code
+=========================================================================
+
+Everything under `custom_components/ecoflow_iot/eflib/` is derived from:
+
+    ha-ef-ble — Home Assistant EcoFlow BLE integration
+    https://github.com/rabits/ha-ef-ble
+    Copyright Rabit <home@rabits.org> and the ha-ef-ble contributors
+    Licensed under the Apache License, Version 2.0
+
+    Vendored from commit 81d52b357c9c6670183d3d6bf474ec37513b7059 (2026-09-07),
+    upstream path `custom_components/ef_ble/eflib/`.
+
+The protocol reverse engineering that `ha-ef-ble` is built on comes from:
+
+    ef-ble-reverse
+    https://github.com/rabits/ef-ble-reverse
+    Copyright Rabit <home@rabits.org>
+    Licensed under the Apache License, Version 2.0
+
+A copy of the Apache License, Version 2.0 is in the `LICENSE` file next to this
+notice. It governs this directory only; the rest of this repository is MIT licensed
+(see the repository root `LICENSE`). The license text is byte-identical to upstream's
+except for one line: upstream's appendix reads "Copyright 2013-2017 Docker, Inc.",
+a leftover from templating that file, and is replaced here with the real copyright
+holder so the vendored notice does not carry demonstrably wrong provenance.
+
+Scope of the vendored subset
+----------------------------
+
+Only the import closure of the Wave 3 and River 3 device modules is vendored: 36
+upstream Python files, plus three package `__init__.py` modules authored here (the
+package root, `devices/` and `model/`), so 39 `.py` files in this tree alongside
+`LICENSE` and this notice. Upstream's other ~40 device modules, their protobuf
+definitions and their fixed-length packet models are deliberately absent, as are all
+of upstream's Home Assistant platform modules — this integration has its own.
+
+Modifications
+-------------
+
+Required by section 4(b) of the Apache License. Every change is also marked in place
+with a `MODIFICATION vs upstream` comment.
+
+1. `__init__.py` — rewritten. Upstream discovers device classes by globbing
+   `devices/*.py` and importing every module at package import time, and resolves an
+   unknown serial to an `UnsupportedDevice` placeholder. Replaced by an explicit
+   registry (`SUPPORTED_DEVICE_CLASSES`), a pure connection-free advertisement
+   classifier (`identify` -> `DeviceIdentity`), `new_device` in place of `NewDevice`
+   returning `None` for unsupported serials, and `sn_from_advertisement` returning
+   `str` instead of `bytes`. Upstream's `is_unsupported` / `is_solar_only` /
+   `get_fixed_length_coding_device` helpers are dropped with the device modules they
+   applied to.
+
+2. `devices/__init__.py` — rewritten as a plain package marker; the autoimport glob
+   is gone (see 1).
+
+3. `model/__init__.py` — rewritten as a plain package marker; upstream re-exports
+   heartbeat-pack dataclasses that are not part of this closure.
+
+4. `devicebase.py` — added `DeviceBase.model_name(serial, advertised_name)` as a
+   classmethod and made the `device` property delegate to it, so a discovery can be
+   named without constructing a device; added `DeviceBase.advertised_name`, capturing
+   the advertised local name for model resolution (never for matching).
+
+5. `devices/river3.py` — the `device` property became the `model_name` classmethod
+   (see 4); model strings unchanged.
+
+6. `devices/river3_plus.py` — the `device` property became the `model_name`
+   classmethod (see 4), and the R635 serial prefix is resolved from the advertised
+   local-name segment instead of being labelled "River 3 Plus Wireless"
+   unconditionally: EcoFlow ships at least two SKUs behind that prefix (a River 3 Plus
+   Wireless advertising `EF-R3…` and a River 3 Pro advertising `EF-R3PR…`). Added the
+   `usbc2_output_power`, `usba2_output_power`, `dc2_input_power` and
+   `dc24v_output_power` fields for the extra ports of the larger R63x units.
+
+7. `devices/wave3.py` — declared the five `RuntimePropertyUpload` temperatures
+   (`temp_indoor_return_air`, `temp_outdoor_ambient`, `temp_condenser`,
+   `temp_evaporator`, `temp_compressor_discharge`). Upstream already decodes that
+   message but declares no fields for them, so the values were parsed and discarded.
+
+8. `pb/__init__.py` — dropped upstream's `sys.path` insertion. It exists so generated
+   protobuf modules can import each other by bare module name; none of the four
+   definitions in this closure does, and mutating a Home Assistant process's
+   `sys.path` from a custom component is worth avoiding.
+
+9. `devicebase.py` — `_ScanRecordV2` renamed to `ScanRecord` and made public, so the
+   config flow can read the advertised session-key scheme without constructing a
+   device. (The scheme does not decide whether account credentials are needed — see
+   11.)
+
+10. `devicebase.py` — corrected the capability-flag bound in
+    `ScanRecord.from_manufacturer_data`: the guard was `len(...) > 19` while indexing
+    byte 22, so a 20-22 byte manufacturer payload raised IndexError. Newly reachable
+    because the config flow now parses arbitrary advertisements without connecting.
+
+11. `connection.py` / `devicebase.py` — explicit `user_id` contract.
+    `DeviceBase.connect` typed it `str | None = None` while `Connection.__init__`
+    required `str`, and a missing value surfaced as
+    "first argument must be string or compiled pattern" from `re.compile(None)` in
+    the logging layer's redaction pattern. `Connection.__init__` now raises a
+    `ValueError` naming the requirement, and `connect`'s `user_id` is required. An
+    account id is needed for every session-key scheme: `_auto_authentication` runs
+    unconditionally and always sends MD5(user_id + serial).
+
+12. `devices/wave3.py` — decorated `set_battery_charge_limit_min` /
+    `set_battery_charge_limit_max` with `controls.battery` (dynamic partner bounds),
+    exactly as `river3.py` does, and widened `limit` from `int` to `float` with
+    `int()` at the wire to match. Upstream leaves them undecorated, so
+    `get_controls` cannot discover them and the Home Assistant layer had to carry a
+    second, parallel mapping to build the two number entities.
+
+13. `devices/wave3.py` — wired three ConfigWrite commands upstream leaves unwired,
+    each with its readback twin declared so no state is optimistic:
+    `set_temp_unit` (`cfg_user_temp_unit` <-> `user_temp_unit`),
+    `set_lcd_show_temp_type` (`cfg_lcd_show_temp_type` <-> `lcd_show_temp_type`) and
+    `set_ac_charging_speed` (`cfg_plug_in_info_ac_in_chg_pow_max` <->
+    `plug_in_info_ac_in_chg_pow_max`, bounded by the device's own
+    `plug_in_info_ac_in_chg_hal_pow_max`). See "Wave 3 control coverage" below for
+    why these three and not the rest.
+
+No frame format, encryption path, packet routing or protobuf definition differs from
+upstream, and no existing command was altered. Modifications 6, 7 and 13 do change
+what this integration can put on the wire: 13 emits three ConfigWrite commands for
+Wave 3 that upstream never sends for this device (`cfg_user_temp_unit`,
+`cfg_lcd_show_temp_type`, `cfg_plug_in_info_ac_in_chg_pow_max`). Every added read
+field and every added command uses a field the vendored `.proto` definitions already
+declare — nothing was reverse engineered or guessed here.
+
+Wave 3 control coverage
+-----------------------
+
+`ac517_apl_comm.proto` declares more ConfigWrite fields than are wired. The bar
+applied here is that the field's value semantics must be pinned by these
+Apache-2.0 sources — a named protobuf enum, or an enum upstream already authored —
+AND it must have a readback field, because a control with no readback would need
+optimistic state. Fields left unwired, with the exact missing prerequisite:
+
+- `cfg_drainage_mode` (160), `cfg_mood_light_mode` (161): bare `uint32` with a
+  readback but no enum anywhere in these sources. Wave 2's `DrainMode` does not
+  transfer — that device uses a different, fixed-length protocol with 0x59 opcodes,
+  not ac517 protobuf. PREREQUISITE: observed value/label pairs from the hardware or
+  app for each mode.
+- `cfg_lcd_light` (14): readback `lcd_light` exists; the brightness scale (0-100 vs
+  a small step count) is undeclared. PREREQUISITE: the value range.
+- `cfg_screen_off_time` (12), `cfg_dev_standby_time` (13),
+  `cfg_power_off_delay_set` (209): readbacks exist; the time unit (seconds vs
+  minutes) and whether the device accepts arbitrary values or a fixed set are
+  undeclared. PREREQUISITE: unit and permitted values.
+- `cfg_temp_pet_care_warning` (164): readback `temp_pet_care_warning` exists and the
+  type is a temperature float in the device's own unit, but a number entity needs
+  bounds and none are declared. Guessing a range on a pet-safety threshold is not
+  acceptable. PREREQUISITE: the permitted min/max.
+- `cfg_beep_en` (9), `cfg_sys_pause` (172): NO readback field exists in either
+  upload message, so a switch would have to invent its own state. PREREQUISITE: a
+  readback field, which this protocol version does not appear to have.
+- `reset_factory_setting` (5), `cfg_soc_cali` (31): destructive/calibration
+  operations with no readback. Deliberately not exposed.
+- `set_time_task` (39), `cfg_time_task_v2_item` (127),
+  `active_selected_time_task_v2` (128): device-side schedules. A whole feature with
+  its own data model (`TIME_TASK_TYPE` includes COOLING/HEATING/VENTING/
+  DEHUMIDIFYING/THERMOSTATIC), not a single control. Out of scope here.
+- `cfg_utc_time` (6), `cfg_utc_timezone` (7), `cfg_utc_timezone_id` (135),
+  `cfg_utc_set_mode` (136), `cfg_bms_push` (32) and the four upload-period /
+  `active_*_full_upload` fields: plumbing and diagnostics, not user-facing controls.
+
+No unlicensed source was consulted for any of this; the evidence is the vendored
+`.proto` definitions and upstream's own device modules.
+
+Known interaction: the generated `pb/*_pb2` modules register their descriptors in
+protobuf's global default pool under the proto file names `pr705.proto`,
+`ac517_apl_comm.proto` and `utc_sys.proto`. Running this integration alongside
+`rabits/ha-ef-ble` in the same Home Assistant process was verified to be fine while
+the files are identical — the pool deduplicates an identical re-registration. If
+upstream regenerates one of those three definitions and a user has both installed,
+the second import raises `TypeError: duplicate file name` (confirmed against
+protobuf 6.33 with a synthetic divergent file). Re-check when re-syncing from
+upstream.

@@ -11,6 +11,58 @@ CONF_ACCESS_KEY: Final = "access_key"
 CONF_SECRET_KEY: Final = "secret_key"
 CONF_REGION: Final = "region"
 
+# Transport selector. Absent means the entry is a cloud (Open API) account entry;
+# the BLE transport is chosen per device at config time and never mixed into one
+# entry, so an entry either talks to the cloud or to one Bluetooth device.
+CONF_TRANSPORT: Final = "transport"
+TRANSPORT_CLOUD: Final = "cloud"
+TRANSPORT_BLE: Final = "ble"
+
+# BLE entry keys (transport == TRANSPORT_BLE)
+CONF_ADDRESS: Final = "address"
+CONF_SERIAL: Final = "serial"
+CONF_LOCAL_NAME: Final = "local_name"
+CONF_MODEL: Final = "model"
+# Name chosen before any entity exists. Naming a device after its entities are
+# created leaves their ids built from the old name, so it is asked for up front.
+CONF_DEVICE_NAME: Final = "device_name"
+# EcoFlow account user ID. Only devices advertising encryption type 7 need it;
+# it is the sole thing kept from an optional e-mail/password login.
+CONF_USER_ID: Final = "user_id"
+CONF_EMAIL: Final = "email"
+CONF_PASSWORD: Final = "password"
+CONF_LOGIN_REGION: Final = "login_region"
+# Seconds between the periodic data requests the device answers over BLE.
+CONF_UPDATE_PERIOD: Final = "update_period"
+DEFAULT_UPDATE_PERIOD: Final = 10
+# Cap on a single BLE connect attempt. Kept short on purpose: habluetooth's
+# connect-failure penalty is sticky, so a long blind attempt through the nearest
+# proxy is worse than failing fast and letting the next attempt be re-scored.
+BLE_CONNECT_TIMEOUT: Final = 10.0
+# BLE attempts inside one supervisor pass. Home Assistant re-picks the proxy for
+# each of them, so a second attempt is a genuine second path, not a repeat.
+BLE_CONNECT_ATTEMPTS: Final = 2
+# Outer bound on one supervisor pass: link established *and* authenticated.
+BLE_READY_TIMEOUT: Final = 45.0
+# How long entry setup waits for the first authenticated link before returning.
+# It never fails the entry - the supervisor keeps trying - it only decides how
+# long Home Assistant's startup is held for entities that would come up populated.
+BLE_SETUP_READY_WAIT: Final = 20.0
+# Reconnect backoff, in seconds, held at the last step forever. Retrying is never
+# abandoned: a power station out of range for a day must come back on its own.
+BLE_BACKOFF_SECONDS: Final = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
+# Fraction of jitter applied to each backoff step, so several devices that dropped
+# together do not line their retries up on the same proxy.
+BLE_BACKOFF_JITTER: Final = 0.2
+# Window over which link drops are counted for the connection diagnostic.
+BLE_DROP_WINDOW_SECONDS: Final = 3600.0
+# Total budget for one command: the queue wait and the round trip together, so a
+# backlog cannot multiply the wait a user is made to sit through.
+BLE_COMMAND_TIMEOUT: Final = 15.0
+# Outer bound on releasing a link. Bleak's own disconnect is already capped, but
+# a wedged transport can stall inside it and unload must never hang on that.
+BLE_DISCONNECT_TIMEOUT: Final = 8.0
+
 # Options keys
 CONF_POLL_INTERVAL: Final = "poll_interval"
 CONF_MQTT_STALE_SECONDS: Final = "mqtt_stale_seconds"
