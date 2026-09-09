@@ -85,9 +85,20 @@ class UpdatableProps:
 
     def _notify_updated(self):
         self._recompute()
-        for field_name in self.updated_fields:
+        # `updated_fields` is mutated while notifying (a callback may write a field),
+        # so snapshot it first and use the snapshot for the coalesced notification.
+        updated = tuple(self.updated_fields)
+        for field_name in updated:
             self.update_callback(field_name)  # type: ignore[attr-defined]
             self.update_state(field_name, getattr(self, field_name))  # type: ignore[attr-defined]
+
+        # MODIFICATION vs upstream (ha-ecoflow-iot): one coalesced notification per
+        # frame for consumers registered without a property name - see
+        # `DeviceBase.notify_state_changed`, which upstream never invokes.
+        if updated:
+            notify = getattr(self, "notify_state_changed", None)
+            if notify is not None:
+                notify()
 
     def _get_entities[E: "EntityType"](
         self,

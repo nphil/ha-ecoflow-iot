@@ -30,5 +30,5 @@
   "issue_tracker": "https://github.com/nphil/ha-ecoflow-iot/issues",
   "loggers": ["paho", "custom_components.ecoflow_iot"],
   "requirements": ["ecdsa~=0.19", "PyCryptodome~=3.23", "protobuf~=6.30"],
-  "version": "0.45.0"
+  "version": "0.45.1"
 }

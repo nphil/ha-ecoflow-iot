@@ -859,3 +859,108 @@ def test_packet_coverage_never_emits_frame_content(caplog):
         run = secret[start : start + 4]
         assert run.hex() not in text.lower()
         assert run.hex(" ") not in text.lower()
+
+
+# ------------------------------------------------------------- update notifications
+
+
+def test_property_less_callback_fires_on_any_update():
+    """
+    `register_callback(cb)` with no propname must actually notify
+
+    Upstream filled `self._callbacks` and never read it, so a consumer that
+    registered there - as the docstring invites - saw values land on the device while
+    nothing ever told it to re-render. That is exactly what left every entity unknown
+    on a healthy authenticated link.
+    """
+    device = make_device("R655TEST00001234", "EF-R31234")
+    calls: list[int] = []
+    device.register_callback(lambda: calls.append(1))
+
+    feed(
+        device,
+        0x15,
+        pr705_pb2.DisplayPropertyUpload(
+            cms_batt_soc=41,
+            pow_get_ac_in=12.5,
+            pow_get_ac_out=-30.0,
+            pow_in_sum_w=12.5,
+            pow_out_sum_w=30.0,
+            pow_get_pv=0,
+            bms_max_cell_temp=27,
+            flow_info_ac_out=2,
+            flow_info_12v=0,
+            errcode=0,
+        ),
+    )
+
+    assert calls, "property-less callback was never invoked"
+    # one notification for the whole frame, not one per changed field - a real frame
+    # carries hundreds of bytes and dozens of fields, and each notification is a Home
+    # Assistant state write
+    assert len(device.updated_fields) > 5
+    assert len(calls) == 1
+
+
+def test_property_less_callback_is_silent_without_changes():
+    device = make_device("R655TEST00001234", "EF-R31234")
+    payload = pr705_pb2.DisplayPropertyUpload(cms_batt_soc=41)
+    feed(device, 0x15, payload)
+
+    calls: list[int] = []
+    device.register_callback(lambda: calls.append(1))
+    # same values again: nothing changed, so nothing to publish
+    feed(device, 0x15, payload)
+
+    assert calls == []
+
+
+def test_removed_callback_stops_firing():
+    device = make_device("R655TEST00001234", "EF-R31234")
+    calls: list[int] = []
+
+    def cb():
+        calls.append(1)
+
+    device.register_callback(cb)
+    feed(device, 0x15, pr705_pb2.DisplayPropertyUpload(cms_batt_soc=41))
+    device.remove_callback(cb)
+    feed(device, 0x15, pr705_pb2.DisplayPropertyUpload(cms_batt_soc=42))
+
+    assert len(calls) == 1
+
+
+def test_per_property_callbacks_still_target_only_their_property():
+    device = make_device("R655TEST00001234", "EF-R31234")
+    soc: list[int] = []
+    ac: list[int] = []
+    device.register_callback(lambda: soc.append(1), "battery_level")
+    device.register_callback(lambda: ac.append(1), "ac_input_power")
+
+    feed(device, 0x15, pr705_pb2.DisplayPropertyUpload(cms_batt_soc=41))
+
+    assert len(soc) == 1
+    assert ac == []
+
+
+def test_manual_field_notification_reaches_property_less_callbacks():
+    """
+    `notify_field` is how a `default_when_missing` field falls back to its off value
+
+    The device never sent the message, so no frame drives it - but it is still a state
+    change, and a consumer registered without a property name must learn about it.
+    """
+    device = make_device("R655TEST00001234", "EF-R31234")
+    generic: list[int] = []
+    per_prop: list[int] = []
+    values: list[object] = []
+    device.register_callback(lambda: generic.append(1))
+    device.register_callback(lambda: per_prop.append(1), "dc_12v_port")
+    device.register_state_update_callback(values.append, "dc_12v_port")
+
+    device.notify_field(river3.Device.dc_12v_port, False)
+
+    assert device.dc_12v_port is False
+    assert generic == [1]
+    assert per_prop == [1]
+    assert values == [False]

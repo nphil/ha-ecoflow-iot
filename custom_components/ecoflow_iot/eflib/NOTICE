@@ -132,6 +132,23 @@ with a `MODIFICATION vs upstream` comment.
     known 16-byte secret on the auth header and asserts no 4-byte run of it appears
     in the emitted line.
 
+15. `devicebase.py` / `props/updatable_props.py` — the property-less update callbacks
+    now fire. `register_callback(cb)` without a `propname` fills
+    `DeviceBase._callbacks`,
+    which upstream never read, so a consumer registering there - as the method's own
+    docstring invites - received nothing while values landed on the device correctly.
+    On a live River 3 Pro this presented as an authenticated link, frames parsing,
+    fields decoding, and every Home Assistant entity stuck on unknown. Added
+    `DeviceBase.notify_state_changed()` and called it once per parsed frame from
+    `UpdatableProps._notify_updated` when at least one field changed, so a frame
+    carrying fifty fields is one notification rather than fifty. `updated_fields` is
+    snapshotted before notifying, since a callback may write a field and mutate the
+    set mid-iteration. `notify_field` notifies them too, so the single-field
+    `default_when_missing` fallback - which is driven by a timer with no frame behind
+    it - also reaches a consumer registered without a property name. The
+    per-property callbacks and the `with_update_period` throttle that applies to them
+    are unchanged.
+
 No frame format, encryption path, packet routing or protobuf definition differs from
 upstream, and no existing command was altered. Modifications 6, 7 and 13 do change
 what this integration can put on the wire: 13 emits three ConfigWrite commands for

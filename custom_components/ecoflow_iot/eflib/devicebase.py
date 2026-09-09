@@ -600,6 +600,19 @@ class DeviceBase(abc.ABC):
 
         self._props_to_update.clear()
 
+    # MODIFICATION vs upstream (ha-ecoflow-iot): invoke the property-less callbacks.
+    # `register_callback(cb)` with no `propname` fills `self._callbacks`, which
+    # upstream never reads - so registering there, exactly as its docstring invites,
+    # silently published nothing. That dead branch cost a full live debugging cycle
+    # here: the link authenticated, frames parsed, values landed on the device, and
+    # every Home Assistant entity stayed unknown because nothing ever told it to
+    # re-render. Called once per parsed frame from `UpdatableProps._notify_updated`,
+    # so a frame carrying fifty fields is one notification rather than fifty.
+    def notify_state_changed(self) -> None:
+        """Notify property-less callbacks that this device's state changed"""
+        for callback in tuple(self._callbacks):
+            callback()
+
     def register_state_update_callback(
         self, state_update_callback: Callable[[Any], None], propname: str
     ):
@@ -633,6 +646,12 @@ class DeviceBase(abc.ABC):
 
         self.update_callback(name)
         self.update_state(name, value)
+        # MODIFICATION vs upstream (ha-ecoflow-iot): a single-field notification is a
+        # state change like any other, so the property-less callbacks have to see it
+        # too. This path is how `default_when_missing` fields fall back to their off
+        # value when the device never sent the message - without this, a consumer
+        # registered without a property name would never learn about it.
+        self.notify_state_changed()
 
     def _schedule_missing_field_defaults(self, state: ConnectionState) -> None:
         if not state.authenticated:

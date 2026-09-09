@@ -129,8 +129,10 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         self._connected = False
         self._notify_scheduled = False
         self._reconnect_attempt = 0
-        self._scanner_source: str | None = None
+        self._last_published = 0.0
+        self._pending_publish: asyncio.TimerHandle | None = None
         self._remove_frame_listener: Callable[[], None] | None = None
+        self._scanner_source: str | None = None
         self._last_frame: float | None = None
         # Monotonic for the rolling window, wall clock for what is reported: a
         # monotonic reading is meaningless as a timestamp to anything reading it.
@@ -197,11 +199,17 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         entry loads and the supervisor keeps trying.
         """
         self._hold = True
-        self.device.register_callback(self._handle_device_update)
         # Frame age is measured from receipt, not from a value changing: a device
         # repeating an identical frame is still answering, and a diagnostic that
         # said otherwise would report a healthy link as silent.
         self._remove_frame_listener = self.device.on_packet_parsed(self._handle_frame)
+        # Publication hangs off the property-less notification, which eflib fires
+        # once per parsed frame that changed at least one field and does not put
+        # through the per-property update-period throttle. Registering per
+        # property instead would republish on a throttle with no trailing edge,
+        # so a device that went quiet after its last change would leave that
+        # value unpublished until the next one.
+        self.device.register_callback(self._handle_device_update)
         self._supervisor = self.config_entry.async_create_background_task(
             self.hass,
             self._supervise(),
@@ -239,6 +247,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
                     "%s: link supervisor failed; releasing anyway", self.device_name
                 )
 
+        if self._pending_publish is not None:
+            self._pending_publish.cancel()
+            self._pending_publish = None
         self.device.remove_callback(self._handle_device_update)
         if self._remove_frame_listener is not None:
             self._remove_frame_listener()
@@ -347,12 +358,21 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
 
     def configure(self, *, update_period: int) -> None:
         """Apply entry options to the device without disturbing a live link."""
+        changed = update_period != self._update_period
         self._update_period = update_period
         (
             self.device.with_update_period(update_period)
             .with_disabled_reconnect(True)
             .with_connection_options(Connection.Options(timeout=BLE_CONNECT_TIMEOUT))
         )
+        if changed and self._pending_publish is not None:
+            # A frame is queued behind the *old* window. Leaving its timer alone
+            # would hold the newest values back for the old delay - shortening
+            # the interval, or setting it to 0, would visibly do nothing until
+            # then. Re-evaluate the queued frame against the new window instead.
+            self._pending_publish.cancel()
+            self._pending_publish = None
+            self._handle_device_update()
 
     # -- commands ---------------------------------------------------------------
 
@@ -438,20 +458,44 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
 
     @callback
     def _handle_frame(self, packet: Any) -> None:
-        """Timestamp a packet the device sent, whether or not it changed a value."""
+        """Timestamp a packet the device sent, whether or not it changed a value.
+
+        This is decode time - fields have not been written yet - so it only ever
+        records contact. Publication is driven separately, after the parse.
+        """
         self._last_frame = time.monotonic()
 
     @callback
     def _handle_device_update(self) -> None:
-        """A device property changed; publish the frame once, not per property."""
-        if self._notify_scheduled:
+        """A parsed frame changed at least one value; republish, rate-limited.
+
+        eflib fires this once per changed frame and does NOT throttle it, so the
+        update period is honoured here instead - otherwise configuring it would
+        do nothing. The first frame after a quiet spell publishes immediately;
+        frames inside the window are coalesced into a single trailing publish at
+        the end of it, so the last value a device sends before going quiet is
+        always the one Home Assistant ends up showing.
+        """
+        if self._update_period <= 0:
+            self._publish_frame()
             return
-        self._notify_scheduled = True
-        self.hass.loop.call_soon(self._publish_frame)
+
+        elapsed = self.hass.loop.time() - self._last_published
+        if elapsed >= self._update_period:
+            self._publish_frame()
+            return
+
+        if self._pending_publish is None:
+            self._pending_publish = self.hass.loop.call_later(
+                self._update_period - elapsed, self._publish_frame
+            )
 
     @callback
     def _publish_frame(self) -> None:
-        self._notify_scheduled = False
+        if self._pending_publish is not None:
+            self._pending_publish.cancel()
+            self._pending_publish = None
+        self._last_published = self.hass.loop.time()
         self.async_set_updated_data(None)
 
     @callback
@@ -480,9 +524,17 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         A scanner's own name already carries its address - an ESPHome proxy
         reports "nitins-office (54:32:04:3F:03:5E)" - so it is returned as-is.
         Appending the source again produced the doubled "(MAC) (MAC)" seen live.
+
+        The one entity whose job is to report on a broken link must not be the
+        one that raises when the Bluetooth stack is gone, so a missing manager
+        degrades to an unnamed proxy rather than propagating.
         """
         address = self.address.upper()
-        for scanner in bluetooth.async_current_scanners(self.hass):
+        try:
+            scanners = bluetooth.async_current_scanners(self.hass)
+        except RuntimeError:
+            return None
+        for scanner in scanners:
             allocations = scanner.get_allocations()
             if allocations is None:
                 continue
