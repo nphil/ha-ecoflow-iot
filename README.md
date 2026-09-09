@@ -299,10 +299,14 @@ cloud once it is set up.
   EcoFlow error `1006` ("current device is not allowed to get device info"), so the cloud
   coordinator skips those devices silently — there is no cloud path to extend for them.
 - **No supported LAN route to them is known.** EcoFlow documents no local IP API for
-  these models, and none has been found in practice. That is a statement about what is
-  documented and observed today, not a proof that none could exist: if a supported local
-  IP path turns up, it belongs alongside Bluetooth in the transport layer rather than
-  replacing it.
+  these models, and none has been found in practice. The EcoFlow Android app does carry
+  LAN-mode strings, but the one such mode found there is a per-device capability gate for
+  a different product (a PowerInsight hotspot controlling a Power Kits 5 kVA unit) — not
+  evidence of a home-LAN API for the River 3 or Wave 3, and the app was read at the
+  resource/string level rather than decompiled in full, so absence there proves nothing
+  either. All of that is a statement about what is documented and observed today, not a
+  proof that none could exist: if a supported local IP path turns up, it belongs
+  alongside Bluetooth in the transport layer rather than replacing it.
 - **Bluetooth is the local path that works.** The link is encrypted with keys derived
   from the EcoFlow account ID and the device's own advertised scheme, and the device
   pushes its telemetry over it.
@@ -419,12 +423,20 @@ coverage*.
   instead of one stuck at unknown. The add-on battery's charge, cell temperature and
   serial are diagnostic and disabled by default.
 
-**Every Bluetooth device** also gets a **Connection** diagnostic sensor. Its state is the
-adapter or proxy currently holding the link, or the literal `disconnected`; its attributes
-carry the hold flag, drops in the last hour, the last drop, the current reconnect attempt,
-the scanner source and the seconds since the last frame arrived. While the link is down
-every other entity of that device is unavailable and this one stays available — reporting
-that is its whole purpose, and it is the entity to key an automation off.
+**Every Bluetooth device** also gets a **Connection** diagnostic sensor. While the link is
+down every other entity of that device is unavailable and this one stays available —
+reporting that is its whole purpose, and it is the entity to key an automation off.
+
+- **State** — the adapter or proxy **holding the link right now**, taken from the
+  Bluetooth manager's live connection allocations, or `disconnected` when no link is held.
+- **`scanner_source`** attribute — the advertisement source of the **last connect
+  attempt**, recorded at that moment and not refreshed afterwards. It is not a live view
+  of the holding proxy, so a value that differs from the state only means the device was
+  heard through one scanner and connected through another. **Divergence alone is not
+  roaming** and needs no action.
+- Remaining attributes: hold flag, drops in the last hour, last drop, current reconnect
+  attempt, and seconds since the last frame (measured from receipt, so a repeated
+  identical frame still counts as answering).
 
 Controls in the **config** category (charge limits, charging speed, DC charging type,
 backup reserve, LED, temperature unit, panel temperature display) are created **disabled**
@@ -535,8 +547,9 @@ source to fall back to; see
 **Bluetooth entry**
 
 1. Add a Wave 3 or River 3; confirm the device and its entities are created.
-2. The **Connection** sensor names the adapter or proxy holding the link, and its
-   `seconds_since_last_frame` attribute keeps resetting.
+2. The **Connection** sensor reports a live link — the name of the adapter or proxy
+   holding it, or plain `connected` when the Bluetooth stack offers no allocation data —
+   and its `seconds_since_last_frame` attribute keeps resetting.
 3. Toggle an output / change a setpoint: the device reacts, and the entity settles on the
    value the device pushes back.
 4. Power the device off or carry it out of range: entities go unavailable, **Connection**
@@ -616,7 +629,23 @@ therefore gets exactly the entities its own definition supports; adding a device
 vendored device module plus one registry line in `eflib/__init__.py`, with no platform
 changes.
 
-## Changes in 0.45.0
+## Changes in 0.45
+
+**0.45.1**
+
+- **Bluetooth telemetry now reaches the entities.** The vendored library filled its
+  property-less update-callback list but never read it, so a live River 3 Pro
+  authenticated, parsed frames and decoded fields while every Home Assistant entity sat
+  at unknown. A frame that changes at least one field now notifies once — one
+  notification per frame, not one per field — and the timer-driven single-field fallback
+  notifies too. Details in `eflib/NOTICE`, modification 15.
+- **Connection diagnostic sharpened**: the sensor's state is read from the Bluetooth
+  manager's live connection allocations (the proxy actually holding the link) and no
+  longer doubles a proxy's address in the name, and it degrades to an unnamed proxy
+  instead of raising if the Bluetooth stack has gone away — the one entity whose job is
+  to report a broken link must not be the one that breaks.
+
+**0.45.0**
 
 - **Local Bluetooth transport** for the **Wave 3** (`AC71`) and the **River 3** family
   (`R651`/`R653`/`R654`/`R655`, `R631`/`R634`/`R635`): one config entry per device, a
@@ -638,10 +667,12 @@ changes.
 - **River 3 Plus / Pro**: the shared `R635` prefix resolves to Plus (Wireless) or Pro from
   the advertised name instead of one hard-coded label, and the second USB-C/USB-A, the
   second solar input and the 24 V output become entities once a unit reports them.
-- **Per-device Connection diagnostic** for Bluetooth entries: which adapter or proxy holds
-  the link, drops in the last hour, last drop, reconnect attempt and seconds since the
-  last frame — with address, serial, user ID and proxy names redacted from diagnostics
-  downloads.
+- **Per-device Connection diagnostic** for Bluetooth entries: the proxy or adapter
+  holding the link (or `disconnected`), plus drops in the last hour, last drop, reconnect
+  attempt, seconds since the last frame, and `scanner_source` — the advertisement source
+  of the last connect attempt, which is not a live view of the holding proxy and may
+  legitimately differ from the state. Address, serial, user ID and proxy names are
+  redacted from diagnostics downloads.
 - **The cloud path is unchanged.** Existing cloud entries, their entities and their entity
   ids are untouched by this release.
 

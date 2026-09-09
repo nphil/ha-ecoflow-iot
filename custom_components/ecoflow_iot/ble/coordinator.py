@@ -522,7 +522,7 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         """Name the adapter or proxy currently holding this device's link.
 
         A scanner's own name already carries its address - an ESPHome proxy
-        reports "nitins-office (54:32:04:3F:03:5E)" - so it is returned as-is.
+        reports "<proxy name> (<MAC>)" - so it is returned as-is.
         Appending the source again produced the doubled "(MAC) (MAC)" seen live.
 
         The one entity whose job is to report on a broken link must not be the
