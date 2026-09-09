@@ -21,6 +21,7 @@ from homeassistant.components.bluetooth import (
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.importlib import async_import_module
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryError,
@@ -59,9 +60,10 @@ _REAPPEAR_KEY = f"{DOMAIN}_ble_reappear"
 
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> bool:
     """Set up one EcoFlow device over Bluetooth."""
-    # Imported here so a cloud-only installation does not pay for protobuf and
-    # the crypto stack merely to load the integration.
-    from ..eflib import new_device  # noqa: PLC0415
+    # Imported through the executor: a cloud-only installation never pays for
+    # protobuf and the crypto stack, and the crypto import's ctypes/libgmp
+    # probing never lands on the event loop.
+    eflib = await async_import_module(hass, f"{__package__.rpartition('.')[0]}.eflib")
 
     address: str = entry.data[CONF_ADDRESS]
     serial: str = entry.data[CONF_SERIAL]
@@ -90,7 +92,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
             translation_key="user_id_missing",
         )
 
-    device = new_device(service_info.device, service_info.advertisement)
+    device = eflib.new_device(service_info.device, service_info.advertisement)
     if device is None:
         raise ConfigEntryError(
             translation_domain=DOMAIN,
@@ -149,7 +151,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) 
     """Tear the entry down, releasing the link whether or not platforms unload."""
     _cancel_reappear_callback(hass, entry)
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    await entry.runtime_data.async_stop()
+    # An entry torn down before it finished setting up has no coordinator, and
+    # an unload that raised there would leave the entry stuck in FAILED_UNLOAD.
+    if (coordinator := getattr(entry, "runtime_data", None)) is not None:
+        await coordinator.async_stop()
     return unloaded
 
 

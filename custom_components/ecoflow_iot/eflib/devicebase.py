@@ -1,5 +1,6 @@
 import abc
 import asyncio
+import logging
 import time
 from collections import defaultdict
 from collections.abc import Callable, Coroutine
@@ -38,6 +39,20 @@ from .props.updatable_props import Field, UpdatableProps
 # `default_when_missing` value (covers devices that withhold a whole message while the
 # related hardware is off, e.g. the inverter heartbeat while AC output is off).
 MISSING_DEFAULT_GRACE = 10
+
+# MODIFICATION vs upstream (ha-ecoflow-iot): packet-coverage logger. Named after this
+# module so it sits under the `custom_components.ecoflow_iot` logger the manifest
+# declares, which means a plain `logger:` entry or `logger.set_level` turns it on with
+# no flags and no restart.
+#
+# It answers the only question a "connected but every value unknown" report needs -
+# which packet headers arrive, whether anything claimed them, and which fields they
+# updated - and it is deliberately incapable of printing frame content: header fields,
+# payload LENGTH, and updated field NAMES only. Never payload bytes, never a decoded
+# value, never key or auth material. Upstream's `LogOptions` categories (which do
+# print raw payloads, decrypted frames, session keys and the derived auth secret)
+# remain strictly opt-in through `with_logging_options` and are unaffected by log level.
+_COVERAGE_LOGGER = logging.getLogger(__name__)
 
 
 class _Listeners(ListenerRegistry):
@@ -118,6 +133,10 @@ class DeviceBase(abc.ABC):
         self._props_to_update = set()
         self._wait_until_throttle = 0
         self._packet_version = 0x03
+        # MODIFICATION vs upstream (ha-ecoflow-iot): header tuples already reported by
+        # the packet-coverage log, so a chatty device logs each shape once instead of
+        # every few seconds.
+        self._seen_packet_shapes: set[tuple[int, ...]] = set()
 
         self._reconnect_disabled = False
         self._options = Connection.Options()
@@ -326,6 +345,61 @@ class DeviceBase(abc.ABC):
         """Parse incoming data and trigger sensors update"""
         return False
 
+    # MODIFICATION vs upstream (ha-ecoflow-iot): upstream hands `data_parse` straight
+    # to `Connection`. Routing it through here lets every vendored device report packet
+    # coverage without a per-module edit, and gives the one thing a "connected but
+    # every value unknown" report cannot be diagnosed without: which packet headers
+    # actually arrive, whether any handler claimed them, and which fields they updated.
+    async def dispatch_packet(self, packet: Packet) -> bool:
+        processed = await self.data_parse(packet)
+        self._log_packet_coverage(packet, processed)
+        return processed
+
+    def _log_packet_coverage(self, packet: Packet, processed: bool) -> None:
+        """
+        Log each distinct packet shape once: headers, payload length, field names
+
+        Deliberately incapable of leaking frame content. No payload bytes are read at
+        all - only `len(payload)` - because a payload prefix is exactly where auth and
+        derived key material sits, and the redaction filter covers plaintext serials
+        and account ids, not hex or an MD5 digest. Field NAMES are safe (they are
+        protobuf schema identifiers, already public in this repository); values are not
+        logged. Raw frames stay behind upstream's explicit `LogOptions`.
+        """
+        if not _COVERAGE_LOGGER.isEnabledFor(logging.DEBUG):
+            return
+
+        updated: tuple[str, ...] = ()
+        if UpdatableProps.is_props(self):
+            updated = tuple(sorted(self.updated_fields))
+
+        shape = (
+            packet.src,
+            packet.dst,
+            packet.cmd_set,
+            packet.cmd_id,
+            int(processed),
+            len(updated),
+        )
+        if shape in self._seen_packet_shapes:
+            return
+        self._seen_packet_shapes.add(shape)
+
+        _COVERAGE_LOGGER.debug(
+            "%s packet coverage: src=0x%02X dst=0x%02X cmd_set=0x%02X cmd_id=0x%02X "
+            "version=0x%02X payload_len=%d claimed=%s updated=%d%s",
+            self.name,
+            packet.src,
+            packet.dst,
+            packet.cmd_set,
+            packet.cmd_id,
+            getattr(packet, "version", 0),
+            len(packet.payload),
+            processed,
+            len(updated),
+            f" fields={list(updated)}" if updated else "",
+        )
+
     async def packet_parse(self, data: bytes):
         """Parse packet"""
         return Packet.from_bytes(data)
@@ -356,7 +430,7 @@ class DeviceBase(abc.ABC):
                     ble_dev=self._ble_dev,
                     dev_sn=self._sn,
                     user_id=user_id,
-                    data_parse=self.data_parse,
+                    data_parse=self.dispatch_packet,
                     packet_parse=self.packet_parse,
                     packet_version=self.packet_version,
                     encrypt_type=self.scan_record.encrypt_type,

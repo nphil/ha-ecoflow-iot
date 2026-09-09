@@ -475,14 +475,19 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             self._drops.popleft()
 
     def _holding_scanner(self) -> str | None:
-        """Name the adapter or proxy currently holding this device's link."""
+        """Name the adapter or proxy currently holding this device's link.
+
+        A scanner's own name already carries its address - an ESPHome proxy
+        reports "nitins-office (54:32:04:3F:03:5E)" - so it is returned as-is.
+        Appending the source again produced the doubled "(MAC) (MAC)" seen live.
+        """
         address = self.address.upper()
         for scanner in bluetooth.async_current_scanners(self.hass):
             allocations = scanner.get_allocations()
             if allocations is None:
                 continue
             if any(held.upper() == address for held in allocations.allocated):
-                return f"{scanner.name or scanner.source} ({scanner.source})"
+                return scanner.name or scanner.source
         return None
 
 

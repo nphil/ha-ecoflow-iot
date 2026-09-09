@@ -12,6 +12,7 @@ from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.importlib import async_import_module
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.loader import async_get_integration
 
@@ -67,9 +68,10 @@ def is_ble_entry(entry: ConfigEntry) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
     """Set up EcoFlow IoT from a config entry."""
     if is_ble_entry(entry):
-        # Imported here so a cloud-only installation never loads the Bluetooth
-        # stack, and so a broken protocol import cannot take the cloud down.
-        from . import ble  # noqa: PLC0415
+        # Loaded through the executor: a cloud-only installation never loads
+        # the Bluetooth stack at all, and importing it - which pulls in
+        # PyCryptodome and protobuf - never blocks the event loop.
+        ble = await async_import_module(hass, f"{__package__}.ble")
 
         return await ble.async_setup_entry(hass, entry)
 
@@ -113,7 +115,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> b
 async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
     """Unload a config entry."""
     if is_ble_entry(entry):
-        from . import ble  # noqa: PLC0415
+        ble = await async_import_module(hass, f"{__package__}.ble")
 
         return await ble.async_unload_entry(hass, entry)
 
@@ -126,7 +128,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> 
 async def async_remove_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> None:
     """Clean up anything an entry left outside its own runtime data."""
     if is_ble_entry(entry):
-        from . import ble  # noqa: PLC0415
+        ble = await async_import_module(hass, f"{__package__}.ble")
 
         await ble.async_remove_entry(hass, entry)
 

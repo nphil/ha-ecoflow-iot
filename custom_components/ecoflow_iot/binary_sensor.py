@@ -6,6 +6,7 @@ from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.importlib import async_import_module
 
 from . import EcoFlowConfigEntry, is_ble_entry
 from .devices.base import EcoFlowBinarySensorEntityDescription
@@ -21,9 +22,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up EcoFlow binary sensors from a config entry."""
     if is_ble_entry(entry):
-        from .ble.binary_sensor import async_setup_entry as async_setup_ble_entry
+        module = await async_import_module(hass, f"{__package__}.ble.binary_sensor")
 
-        await async_setup_ble_entry(hass, entry, async_add_entities)
+        await module.async_setup_entry(hass, entry, async_add_entities)
         return
 
     coordinator = entry.runtime_data

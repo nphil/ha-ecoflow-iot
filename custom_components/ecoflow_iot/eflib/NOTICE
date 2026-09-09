@@ -118,6 +118,20 @@ with a `MODIFICATION vs upstream` comment.
     `plug_in_info_ac_in_chg_hal_pow_max`). See "Wave 3 control coverage" below for
     why these three and not the rest.
 
+14. `devicebase.py` — packet-coverage logging. `Connection` is now handed
+    `DeviceBase.dispatch_packet` instead of `data_parse`; it calls `data_parse`
+    unchanged and then logs, once per distinct packet shape, the header fields
+    (src / dst / cmd_set / cmd_id / version), the payload LENGTH, whether a handler
+    claimed the packet, and the NAMES of the fields it updated. It reads
+    `len(payload)` and never indexes the payload, so no frame content, decoded value,
+    key or auth material can reach it; upstream's `LogOptions` categories, which do
+    print those, stay opt-in through `with_logging_options` and are not reachable by
+    log level. The logger is named after this module so it sits under the
+    `custom_components.ecoflow_iot` logger the manifest declares and is switched on
+    with Home Assistant's `logger` integration alone. A regression test dispatches a
+    known 16-byte secret on the auth header and asserts no 4-byte run of it appears
+    in the emitted line.
+
 No frame format, encryption path, packet routing or protobuf definition differs from
 upstream, and no existing command was altered. Modifications 6, 7 and 13 do change
 what this integration can put on the wire: 13 emits three ConfigWrite commands for

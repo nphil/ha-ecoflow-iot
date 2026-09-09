@@ -31,6 +31,8 @@ if "custom_components" not in sys.modules:
     sys.modules["custom_components.ecoflow_iot"] = _pkg
     setattr(_cc, "ecoflow_iot", _pkg)
 
+import logging  # noqa: E402
+
 from custom_components.ecoflow_iot import eflib  # noqa: E402
 from custom_components.ecoflow_iot.eflib.devices import (  # noqa: E402
     river3,
@@ -756,3 +758,104 @@ def test_declared_controls_are_discoverable_per_model():
         "battery_charge_limit_min",
         "energy_backup_battery_level",
     ]
+
+
+# --------------------------------------------------------- packet coverage logging
+
+COVERAGE_LOGGER = "custom_components.ecoflow_iot.eflib.devicebase"
+
+
+def dispatch(device, packet):
+    return asyncio.run(device.dispatch_packet(packet))
+
+
+def telemetry(cmd_id: int, payload: bytes, src: int = 0x02) -> Packet:
+    return Packet(src, 0x20, 0xFE, cmd_id, payload, 0x01, 0x01, 0x13)
+
+
+def test_packet_coverage_reports_headers_and_updated_field_names(caplog):
+    """
+    The one signal a "connected but every value unknown" report needs
+
+    Without it, a frame arriving with an unexpected header is indistinguishable from
+    no frame arriving at all.
+    """
+    device = make_device("R655TEST00001234", "EF-R31234")
+
+    with caplog.at_level(logging.DEBUG, logger=COVERAGE_LOGGER):
+        soc = pr705_pb2.DisplayPropertyUpload(cms_batt_soc=41).SerializeToString()
+        claimed = dispatch(device, telemetry(0x15, soc))
+        # a header no handler claims - the case that leaves every entity unknown
+        unclaimed = dispatch(device, telemetry(0x99, b"\x08\x01", src=0x11))
+
+    assert claimed is True
+    assert unclaimed is False
+
+    text = caplog.text
+    assert "cmd_id=0x15" in text
+    assert "claimed=True" in text
+    assert "battery_level" in text
+    assert "src=0x11 dst=0x20 cmd_set=0xFE cmd_id=0x99" in text
+    assert "claimed=False" in text
+
+
+def test_packet_coverage_is_bounded_not_repeated_per_frame(caplog):
+    """
+    A device pushing telemetry every few seconds must not flood the log
+
+    Each distinct shape logs once. The first frame of a header updates fields and the
+    next identical one updates none (unchanged values are not re-marked), so a steady
+    stream settles at two lines per header and then stops - which is itself the useful
+    signal that frames keep arriving and keep being claimed.
+    """
+    device = make_device("R655TEST00001234", "EF-R31234")
+    payload = pr705_pb2.DisplayPropertyUpload(cms_batt_soc=41).SerializeToString()
+
+    def coverage_lines():
+        return [r for r in caplog.records if "packet coverage" in r.getMessage()]
+
+    with caplog.at_level(logging.DEBUG, logger=COVERAGE_LOGGER):
+        for _ in range(5):
+            dispatch(device, telemetry(0x15, payload))
+        settled = len(coverage_lines())
+
+        for _ in range(50):
+            dispatch(device, telemetry(0x15, payload))
+
+    assert settled <= 2
+    assert len(coverage_lines()) == settled
+
+
+def test_packet_coverage_is_silent_unless_debug_is_enabled(caplog):
+    device = make_device("R655TEST00001234", "EF-R31234")
+
+    with caplog.at_level(logging.INFO, logger=COVERAGE_LOGGER):
+        dispatch(device, telemetry(0x99, b"\x08\x01"))
+
+    assert "packet coverage" not in caplog.text
+
+
+def test_packet_coverage_never_emits_frame_content(caplog):
+    """
+    Payload bytes must not reach a plain-DEBUG log
+
+    A payload prefix is exactly where auth and derived key material sits, and the
+    redaction filter covers plaintext serials and account ids - not hex, not an MD5
+    digest. So the coverage line reads `len(payload)` and nothing else.
+    """
+    secret = bytes.fromhex("00112233445566778899aabbccddeeff")
+    device = make_device("R655TEST00001234", "EF-R31234")
+
+    with caplog.at_level(logging.DEBUG, logger=COVERAGE_LOGGER):
+        dispatch(device, telemetry(0x86, secret, src=0x35))
+
+    text = caplog.text
+    assert "packet coverage" in text
+    assert f"payload_len={len(secret)}" in text
+
+    # neither the whole secret nor any 4-byte run of it, in either hex convention
+    assert secret.hex() not in text.lower()
+    for start in range(len(secret) - 3):
+        run = secret[start : start + 4]
+        assert run.hex() not in text.lower()
+        assert run.hex(" ") not in text.lower()

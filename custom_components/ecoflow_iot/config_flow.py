@@ -39,6 +39,7 @@ from homeassistant.helpers.selector import (
     TextSelectorConfig,
     TextSelectorType,
 )
+from homeassistant.helpers.importlib import async_import_module
 from homeassistant.helpers.storage import Store
 
 from . import is_ble_entry
@@ -115,6 +116,17 @@ async def _async_cached_user_id(hass: HomeAssistant) -> str:
 async def _async_cache_user_id(hass: HomeAssistant, user_id: str) -> None:
     store: Store[dict[str, str]] = Store(hass, _USER_ID_STORE_VERSION, _USER_ID_STORE_KEY)
     await store.async_save({CONF_USER_ID: user_id})
+
+
+async def _async_eflib(hass: HomeAssistant):
+    """Import the protocol package off the event loop.
+
+    Importing it pulls in PyCryptodome, which probes for libgmp with ctypes and
+    scans directories - blocking work Home Assistant rightly complains about if
+    it happens on the loop. Every entry point that needs eflib comes through
+    here so the first import is always the executor's.
+    """
+    return await async_import_module(hass, f"{__package__}.eflib")
 
 
 async def _validate(hass: Any, region: str, access_key: str, secret_key: str) -> None:
@@ -268,13 +280,13 @@ class EcoFlowConfigFlow(ConfigFlow, domain=DOMAIN):
                 return self.async_abort(reason="not_supported")
             return await self.async_step_bluetooth_confirm()
 
-        from .eflib import identify  # noqa: PLC0415
+        eflib = await _async_eflib(self.hass)
 
         configured = self._async_current_ids()
         self._candidates = {}
         labels: dict[str, str] = {}
         for discovery in async_discovered_service_info(self.hass, connectable=True):
-            identity = identify(discovery.advertisement)
+            identity = eflib.identify(discovery.advertisement)
             if identity is None or identity.serial in configured:
                 continue
             self._candidates[discovery.address] = discovery
@@ -306,9 +318,9 @@ class EcoFlowConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _async_adopt(self, discovery: BluetoothServiceInfoBleak) -> bool:
         """Claim a discovered advertisement, or report it is not ours."""
-        from .eflib import identify  # noqa: PLC0415
+        eflib = await _async_eflib(self.hass)
 
-        identity = identify(discovery.advertisement)
+        identity = eflib.identify(discovery.advertisement)
         if identity is None:
             return False
 
@@ -427,7 +439,7 @@ class EcoFlowConfigFlow(ConfigFlow, domain=DOMAIN):
         a convenience for people who do not know theirs, and only the resulting
         ID is kept - the e-mail and password are never written anywhere.
         """
-        from .eflib.login import EcoFlowLogin  # noqa: PLC0415
+        login_module = await async_import_module(self.hass, f"{__package__}.eflib.login")
 
         if user_id := user_input.get(CONF_USER_ID, "").strip():
             if not user_id.isdigit():
@@ -439,7 +451,7 @@ class EcoFlowConfigFlow(ConfigFlow, domain=DOMAIN):
         if not identifier or not password:
             return "", {"base": "user_id_required"}
 
-        login = EcoFlowLogin(async_get_clientsession(self.hass))
+        login = login_module.EcoFlowLogin(async_get_clientsession(self.hass))
         try:
             result = await login.login(
                 identifier, password, user_input.get(CONF_LOGIN_REGION, "auto")
