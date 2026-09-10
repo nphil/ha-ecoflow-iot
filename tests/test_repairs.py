@@ -8,9 +8,8 @@ Three regressions in particular must stay fixed:
 
 * An issue is *never* deleted on the strength of remembered state. Both reconciles
   run unconditionally at setup, so a repair cannot outlive the fault it describes
-  across an entry reload - the failure mode seen live in a sibling integration
-  (issue raised 12:22, fault cleared 13:00, entry reloaded 12:38 in between, repair
-  still open 13 hours later).
+  across an entry reload - which is what a remembered "we raised it" flag cannot
+  survive, and the unsupported-device repair had no delete path at all.
 * A device that is already unreachable when its entry loads must still raise the
   repair, even though no health *transition* ever happens - the setup-time
   reconcile is the only thing that arms the countdown for it.
@@ -31,6 +30,8 @@ import sys
 import types
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 # --- Home Assistant stub -----------------------------------------------------
 # Only what the modules under test import, and total rather than conditional: the
@@ -57,6 +58,12 @@ def fire_timers() -> None:
 def armed_delays() -> list[float]:
     """Delays of the timers still waiting to fire."""
     return [slot[0] for slot in TIMERS if not slot[2]]
+
+
+def _translated_error_init(self: Any, *args: Any, **kwargs: Any) -> None:
+    """Home Assistant's setup exceptions carry translation kwargs, not a message."""
+    Exception.__init__(self, *args)
+    self.translation_key = kwargs.get("translation_key")
 
 
 class StubIssueRegistry:
@@ -161,6 +168,11 @@ def install_ha_stub() -> None:
     bluetooth.async_current_scanners = lambda hass: hass.data.get("scanners", [])
     bluetooth.async_ble_device_from_address = lambda hass, address, connectable: None
     bluetooth.async_last_service_info = lambda hass, address, connectable: None
+    bluetooth.async_register_callback = lambda *args, **kwargs: (lambda: None)
+    bluetooth.BluetoothCallbackMatcher = dict
+    bluetooth.BluetoothChange = object
+    bluetooth.BluetoothServiceInfoBleak = object
+    bluetooth.BluetoothScanningMode = types.SimpleNamespace(PASSIVE="passive")
     components.bluetooth = bluetooth
     repairs = module("homeassistant.components.repairs")
     repairs.RepairsFlow = StubRepairsFlow
@@ -173,7 +185,16 @@ def install_ha_stub() -> None:
     const.ATTR_ENTITY_ID = "entity_id"
     const.SERVICE_TURN_OFF = "turn_off"
     const.SERVICE_TURN_ON = "turn_on"
-    const.Platform = types.SimpleNamespace(SWITCH="switch")
+    const.Platform = types.SimpleNamespace(
+        BINARY_SENSOR="binary_sensor",
+        BUTTON="button",
+        CLIMATE="climate",
+        LIGHT="light",
+        NUMBER="number",
+        SELECT="select",
+        SENSOR="sensor",
+        SWITCH="switch",
+    )
 
     core = module("homeassistant.core")
     core.HomeAssistant = object
@@ -181,8 +202,23 @@ def install_ha_stub() -> None:
 
     exceptions = module("homeassistant.exceptions")
     exceptions.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
+    # Home Assistant's setup exceptions carry translation kwargs.
+    for name in ("ConfigEntryAuthFailed", "ConfigEntryError", "ConfigEntryNotReady"):
+        setattr(
+            exceptions,
+            name,
+            type(name, (Exception,), {"__init__": _translated_error_init}),
+        )
 
     module("homeassistant.helpers", package=True)
+
+    importlib_helper = module("homeassistant.helpers.importlib")
+
+    async def async_import_module(hass: Any, name: str) -> Any:
+        """Whatever was stubbed under that name; nothing here imports for real."""
+        return sys.modules[name]
+
+    importlib_helper.async_import_module = async_import_module
 
     device_registry = module("homeassistant.helpers.device_registry")
     device_registry.CONNECTION_BLUETOOTH = "bluetooth"
@@ -316,11 +352,11 @@ _connection = types.ModuleType("ecoflow_iot.eflib.connection")
 _connection.Connection = type("Connection", (), {"Options": dict})
 sys.modules["ecoflow_iot.eflib.connection"] = _connection
 
-_ble_pkg = types.ModuleType("ecoflow_iot.ble")
-_ble_pkg.__path__ = [str(_ROOT / "ecoflow_iot" / "ble")]
-sys.modules["ecoflow_iot.ble"] = _ble_pkg
-
+# The `ble` package __init__ is imported for real: its setup/unload/remove paths
+# are where the countdown is armed for a device that never advertises, and where
+# it is cancelled and the issue retired. Only `eflib` under it is stubbed.
 from ecoflow_iot import repairs  # noqa: E402
+from ecoflow_iot import ble  # noqa: E402
 from ecoflow_iot.ble import unreachable  # noqa: E402
 from ecoflow_iot.ble.coordinator import EcoFlowBleCoordinator  # noqa: E402
 from ecoflow_iot.const import (  # noqa: E402
@@ -340,10 +376,22 @@ from ecoflow_iot.const import (  # noqa: E402
 import ecoflow_iot.coordinator as cloud_module  # noqa: E402
 from ecoflow_iot.coordinator import EcoFlowCoordinator  # noqa: E402
 
+# Provided by the stub `homeassistant.exceptions` module installed above, not by
+# a real Home Assistant: the not-ready path is what arms the countdown for a
+# device that never advertises, so the tests need the type to assert against.
+from homeassistant.exceptions import ConfigEntryNotReady  # noqa: E402
+
 ADDRESS = "AA:BB:CC:DD:EE:01"
 SERIAL = "R351ZTEST0000001"
 ISSUE_ID = unreachable_issue_id(ADDRESS)
-PROXY = "plant-room-bluetooth-proxy (E8:9F:6D:11:22:33)"
+# The shape habluetooth actually reports: `scanner.adapter` is the ESPHome node
+# name (bleak_esphome passes `device_info.name`), and `scanner.name` is
+# `adapter_human_name(adapter, source)` == "<node> (<MAC>)". The action the
+# esphome integration registers for that node is `name.replace("-", "_")` plus
+# the action's own name.
+PROXY_MAC = "E8:9F:6D:11:22:33"
+PROXY_NODE = "plant-room-bluetooth-proxy"
+PROXY_DISPLAY = f"{PROXY_NODE} ({PROXY_MAC})"
 PROXY_ACTION = "plant_room_bluetooth_proxy_restart_proxy"
 
 
@@ -395,6 +443,11 @@ class FakeConfigEntries:
 
     async def async_reload(self, entry_id: str) -> bool:
         self.reloads.append(entry_id)
+        return True
+
+    async def async_unload_platforms(
+        self, entry: FakeConfigEntry, platforms: list[str]
+    ) -> bool:
         return True
 
 
@@ -459,9 +512,12 @@ class FakeDevice:
 
 
 class FakeScanner:
-    def __init__(self, name: str, allocated: tuple[str, ...]) -> None:
-        self.name = name
-        self.source = "E8:9F:6D:11:22:33"
+    """The slice of a habluetooth scanner the coordinator reads."""
+
+    def __init__(self, node: str, allocated: tuple[str, ...]) -> None:
+        self.adapter = node
+        self.source = PROXY_MAC
+        self.name = f"{node} ({PROXY_MAC})"
         self._allocated = allocated
 
     def get_allocations(self) -> Any:
@@ -471,10 +527,13 @@ class FakeScanner:
 class StubBleCoordinator:
     """The slice of ``EcoFlowBleCoordinator`` the fix flow contracts on."""
 
-    def __init__(self, *, connected: bool = False, scanner: str | None = None) -> None:
+    def __init__(self, *, connected: bool = False, node: str | None = None) -> None:
         self.connected = connected
-        self.holding_scanner = scanner if connected else None
-        self.link_state = (scanner or "connected") if connected else "disconnected"
+        self.holding_proxy_name = node if connected else None
+        if not connected:
+            self.link_state = "disconnected"
+        else:
+            self.link_state = f"{node} ({PROXY_MAC})" if node else "connected"
         self.reconciles = 0
 
     def reconcile_unreachable_issue(self) -> None:
@@ -610,16 +669,17 @@ def test_reconnecting_deletes_the_repair():
 
 
 def test_a_device_that_never_advertises_still_raises_the_repair():
-    """Setup fails before a coordinator exists; the countdown is the entry's own.
+    """The real setup path, which fails before a coordinator can exist.
 
     A device already gone when Home Assistant starts is the most complete outage
-    there is, and it is the one a supervisor-owned countdown never reports: the
-    supervisor is never built.
+    there is, and it is the one a supervisor-owned countdown never reports - the
+    supervisor is never built, because setup raises ConfigEntryNotReady first.
     """
     hass = new_hass()
-    entry = hass.config_entries.add(ble_entry(state=ConfigEntryState.SETUP_RETRY))
+    entry = hass.config_entries.add(ble_entry())
 
-    unreachable.async_reconcile(hass, entry, connected=False)
+    with pytest.raises(ConfigEntryNotReady):
+        asyncio.run(ble.async_setup_entry(hass, entry))
 
     assert armed_delays() == [BLE_UNREACHABLE_SECONDS]
     fire_timers()
@@ -627,37 +687,67 @@ def test_a_device_that_never_advertises_still_raises_the_repair():
 
 
 def test_setup_retries_do_not_push_the_deadline_out():
-    """Every retry re-enters setup; the device has been gone since the first."""
+    """Home Assistant re-enters setup on every retry; the device has been gone
+    since the first one, which is the moment the operator cares about."""
     hass = new_hass()
-    entry = hass.config_entries.add(ble_entry(state=ConfigEntryState.SETUP_RETRY))
+    entry = hass.config_entries.add(ble_entry())
 
     for _ in range(4):
-        unreachable.async_reconcile(hass, entry, connected=False)
+        with pytest.raises(ConfigEntryNotReady):
+            asyncio.run(ble.async_setup_entry(hass, entry))
 
     assert armed_delays() == [BLE_UNREACHABLE_SECONDS]
 
 
 def test_unloading_leaves_no_countdown_behind():
-    """A timer outliving the entry would raise a repair for a device nobody holds."""
+    """A timer outliving the entry would raise a repair for a device nobody holds.
+
+    An entry the user disables is unloaded exactly like one being reloaded, so
+    the cancel has to be on the unload path itself.
+    """
     hass = new_hass()
     entry = hass.config_entries.add(ble_entry())
-    start_ble(hass, entry)
+    coordinator = start_ble(hass, entry)
+    entry.runtime_data = coordinator
 
-    unreachable.async_cancel(hass, entry)
+    assert asyncio.run(ble.async_unload_entry(hass, entry)) is True
     fire_timers()
 
     assert issue_ids(hass) == set()
 
 
-def test_holding_proxy_is_recorded_once_per_change():
-    """The wizard's only proxy candidate, written without churning the entry."""
+def test_removing_the_entry_retires_its_repair():
+    """Nothing else deletes an issue naming a device that is no longer configured."""
+    hass = new_hass()
+    entry = hass.config_entries.add(ble_entry())
+    start_ble(hass, entry)
+    fire_timers()
+    assert issue_ids(hass) == {ISSUE_ID}
+
+    asyncio.run(ble.async_remove_entry(hass, entry))
+
+    assert issue_ids(hass) == set()
+
+
+def test_holding_proxy_is_recorded_as_a_node_name_once_per_change():
+    """The wizard's only proxy candidate, written without churning the entry.
+
+    The node name is what gets stored, not the display name: the display name
+    carries the proxy's address (which diagnostics must not export) and is not
+    what the node's own actions are named after.
+    """
     hass = new_hass()
     entry = hass.config_entries.add(ble_entry(options={CONF_UPDATE_PERIOD: 20}))
-    hass.data["scanners"] = [FakeScanner(PROXY, (ADDRESS,))]
+    hass.data["scanners"] = [FakeScanner(PROXY_NODE, (ADDRESS,))]
     coordinator = start_ble(hass, entry)
 
     coordinator._set_connected(True)
-    assert entry.options == {CONF_UPDATE_PERIOD: 20, CONF_LAST_HOLDING_PROXY: PROXY}
+    assert entry.options == {
+        CONF_UPDATE_PERIOD: 20,
+        CONF_LAST_HOLDING_PROXY: PROXY_NODE,
+    }
+    # The link sensor the household automations read still names the address.
+    assert coordinator.link_state == PROXY_DISPLAY
     writes = hass.config_entries.updates
 
     coordinator._set_connected(False)
@@ -774,15 +864,23 @@ def test_restart_proxy_is_offered_only_with_a_proxy_and_an_action():
     assert unknown["menu_options"] == ["recheck", "reload", "power_cycle"]
 
     # A proxy is known, but nothing exposes a restart action for it.
-    entry.options = {CONF_LAST_HOLDING_PROXY: PROXY}
+    entry.options = {CONF_LAST_HOLDING_PROXY: PROXY_NODE}
     assert asyncio.run(flow(hass).async_step_menu())["menu_options"] == [
         "recheck",
         "reload",
         "power_cycle",
     ]
 
-    # ESPHome exposes the node's action: now the rung can act.
+    # The display name is not the action's name: a rung derived from it would
+    # look up an action nobody registered and vanish.
     hass.services.register("esphome", PROXY_ACTION)
+    entry.options = {CONF_LAST_HOLDING_PROXY: PROXY_DISPLAY}
+    assert "restart_proxy" not in (
+        asyncio.run(flow(hass).async_step_menu())["menu_options"]
+    )
+
+    # The node exposes its action: now the rung can act.
+    entry.options = {CONF_LAST_HOLDING_PROXY: PROXY_NODE}
     assert asyncio.run(flow(hass).async_step_menu())["menu_options"] == [
         "recheck",
         "reload",
@@ -792,20 +890,22 @@ def test_restart_proxy_is_offered_only_with_a_proxy_and_an_action():
 
     # The live holding proxy stands in for the remembered one.
     entry.options = {}
-    entry.runtime_data = StubBleCoordinator(connected=True, scanner=PROXY)
+    entry.runtime_data = StubBleCoordinator(connected=True, node=PROXY_NODE)
     assert "restart_proxy" in asyncio.run(flow(hass).async_step_menu())["menu_options"]
 
 
 def test_the_menu_reports_state_without_inventing_a_last_result():
     hass = new_hass()
-    entry = hass.config_entries.add(ble_entry(options={CONF_LAST_HOLDING_PROXY: PROXY}))
+    entry = hass.config_entries.add(
+        ble_entry(options={CONF_LAST_HOLDING_PROXY: PROXY_NODE})
+    )
     entry.runtime_data = StubBleCoordinator()
 
     placeholders = asyncio.run(flow(hass).async_step_menu())["description_placeholders"]
 
     assert placeholders["device"] == "River 3 Pro"
     assert placeholders["link"] == "disconnected"
-    assert placeholders["proxy"] == PROXY
+    assert placeholders["proxy"] == PROXY_NODE
     assert placeholders["last_result"] == ""
 
 
@@ -844,7 +944,9 @@ def test_reload_goes_through_the_config_entry(monkeypatch):
 
 def test_restart_proxy_calls_the_esphome_action_of_the_remembered_node(monkeypatch):
     hass = new_hass()
-    entry = hass.config_entries.add(ble_entry(options={CONF_LAST_HOLDING_PROXY: PROXY}))
+    entry = hass.config_entries.add(
+        ble_entry(options={CONF_LAST_HOLDING_PROXY: PROXY_NODE})
+    )
     entry.runtime_data = StubBleCoordinator()
     hass.services.register("esphome", PROXY_ACTION)
     monkeypatch.setattr(repairs, "_SETTLE_TIMEOUT", 0.0)

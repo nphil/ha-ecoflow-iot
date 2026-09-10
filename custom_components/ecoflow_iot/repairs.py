@@ -36,7 +36,6 @@ from homeassistant.const import (
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
-from homeassistant.util import slugify
 
 from .const import (
     CONF_ADDRESS,
@@ -226,6 +225,7 @@ class BleRecoveryFixFlow(RepairsFlow):
         # The turn-off is outside the guard on purpose: if it fails, nothing was
         # cut and there is nothing to restore.
         await self._async_switch(outlet, SERVICE_TURN_OFF)
+        restore_failure: Exception | None = None
         try:
             await asyncio.sleep(_POWER_OFF_SECONDS)
         finally:
@@ -234,7 +234,30 @@ class BleRecoveryFixFlow(RepairsFlow):
             # dark because a browser tab was shut is far worse than the fault
             # being unfixed - so the restore is shielded and survives the very
             # cancellation that reached this line.
-            await asyncio.shield(self._async_switch(outlet, SERVICE_TURN_ON))
+            try:
+                await asyncio.shield(self._async_switch(outlet, SERVICE_TURN_ON))
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - reported, never swallowed
+                # Nothing here can restore power the switch itself refuses to
+                # restore, but the operator must be told which outlet is still
+                # off rather than being shown an opaque failed flow.
+                restore_failure = err
+                _LOGGER.error(
+                    "Failed to switch %s back on after power-cycling %s; the "
+                    "device may still have no mains power: %s",
+                    outlet,
+                    entry.title,
+                    err,
+                )
+
+        if restore_failure is not None:
+            self._last_result = (
+                f"{outlet} could not be switched back on ({restore_failure}) - the "
+                "device may still have NO power. Restore it by hand before retrying."
+            )
+            return await self.async_step_menu()
+
         return await self._async_settle(
             _POWER_CYCLE_TIMEOUT, f"Power-cycled the device through {outlet}"
         )
@@ -309,7 +332,7 @@ class BleRecoveryFixFlow(RepairsFlow):
 
 
 def _known_proxy(entry: ConfigEntry) -> str | None:
-    """The proxy to act on: the one holding the link, else the last one that did.
+    """The node to act on: the one holding the link, else the last one that did.
 
     An unreachable device has no holding scanner - which is exactly when this is
     asked - so the remembered name is normally the only answer there is. The
@@ -317,22 +340,27 @@ def _known_proxy(entry: ConfigEntry) -> str | None:
     different proxy makes the remembered name stale.
     """
     coordinator: EcoFlowBleCoordinator | None = getattr(entry, "runtime_data", None)
-    if coordinator is not None and (live := coordinator.holding_scanner):
+    if coordinator is not None and (live := coordinator.holding_proxy_name):
         return live
     return entry.options.get(CONF_LAST_HOLDING_PROXY)
 
 
-def _proxy_action(hass: HomeAssistant, proxy: str | None) -> str | None:
-    """The ESPHome restart action for a scanner name, if that node exposes one.
+def _proxy_action(hass: HomeAssistant, node: str | None) -> str | None:
+    """The ESPHome restart action for a proxy node, if that node exposes one.
 
-    ``habluetooth`` names an ESPHome scanner "<node name> (<MAC>)" and only the
-    node name is part of its action ids, so the address is dropped before
-    slugifying: "plant-room-bluetooth-proxy (E8:...)" becomes
-    ``esphome.plant_room_bluetooth_proxy_restart_proxy``.
+    Derived exactly as the esphome integration registers it, which is
+    ``f"{device_info.name.replace('-', '_')}_{action}"`` (core's
+    ``esphome/manager.py``, ``build_service_name``) - so
+    ``plant-room-bluetooth-proxy`` exposes
+    ``esphome.plant_room_bluetooth_proxy_restart_proxy``. Guessing at that
+    transformation instead is how the rung silently disappears: it is offered
+    only when the derived name resolves, so a name derived wrongly resolves to
+    nothing and takes the whole rung with it. Case is not normalised here
+    because ``has_service`` already lowercases what it is given.
     """
-    if not proxy:
+    if not node:
         return None
-    action = f"{slugify(proxy.split(' (')[0])}{_RESTART_PROXY_SUFFIX}"
+    action = f"{node.replace('-', '_')}{_RESTART_PROXY_SUFFIX}"
     # `has_service` rather than `async_services()`: the latter deep-copies every
     # service in the instance, which its own docstring says to avoid when one
     # exact name is all that is being asked about - and this runs per menu draw.

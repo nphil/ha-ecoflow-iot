@@ -170,21 +170,23 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         )
 
     @property
-    def holding_scanner(self) -> str | None:
-        """Name of the proxy holding the link, or ``None`` if none holds it.
+    def holding_proxy_name(self) -> str | None:
+        """Node name of the proxy holding the link, or ``None`` if none does.
 
-        Unlike :attr:`link_state` this never substitutes a word for a name, so
-        a caller that wants to *act* on the proxy - the recovery flow deriving
-        an ESPHome action from it - cannot mistake "connected" for a node.
+        This is the name to *act* on - the one an ESPHome node registers its
+        actions under - as opposed to :attr:`link_state`, which reports the
+        display name for humans and substitutes a word when no proxy can be
+        named. A caller deriving an action from that would happily look up
+        "connected" or a name with an address glued to it.
         """
-        return self._holding_scanner() if self._connected else None
+        return self._holding_node() if self._connected else None
 
     @property
     def link_state(self) -> str:
         """Name of the proxy holding the link, or ``"disconnected"``."""
         if not self._connected:
             return LINK_DISCONNECTED
-        return self.holding_scanner or "connected"
+        return self._holding_scanner() or "connected"
 
     @property
     def link_attributes(self) -> dict[str, Any]:
@@ -245,10 +247,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             )
         # Reconciled here, unconditionally, as well as on every health
         # transition: a reload re-enters this line, and that is what stops a
-        # repair from outliving the fault it describes. Gating the delete on a
-        # remembered "we raised it" flag is how a sibling integration left an
-        # issue raised at 12:22 open 13 hours after the fault cleared at 13:00
-        # - the entry reloaded at 12:38 and took the flag with it (2026-09-09).
+        # repair from outliving the fault it describes. A remembered "we raised
+        # it" flag cannot do that job - it dies with the reload, leaving the
+        # issue with nothing left that would ever delete it.
         self.reconcile_unreachable_issue()
         return self._auth_error
 
@@ -500,18 +501,20 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         A device that has gone away has no holding scanner, so by the time the
         wizard wants to restart the proxy in front of it there is nothing left
         to discover: whichever one was holding the link is the only candidate.
-        Written only when it changed - every options write wakes the entry's
+        The node name is stored rather than the display name - it is what the
+        proxy's own actions are named after, and it carries no address.
+        Written only when it changed: every options write wakes the entry's
         update listener, and a link flapping between two proxies would
         otherwise rewrite the entry on each reconnect.
         """
-        scanner = self._holding_scanner()
-        if not scanner:
+        node = self._holding_node()
+        if not node:
             return
-        if self.config_entry.options.get(CONF_LAST_HOLDING_PROXY) == scanner:
+        if self.config_entry.options.get(CONF_LAST_HOLDING_PROXY) == node:
             return
         self.hass.config_entries.async_update_entry(
             self.config_entry,
-            options={**self.config_entry.options, CONF_LAST_HOLDING_PROXY: scanner},
+            options={**self.config_entry.options, CONF_LAST_HOLDING_PROXY: node},
         )
 
     # -- internals --------------------------------------------------------------
@@ -591,6 +594,28 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         A scanner's own name already carries its address - an ESPHome proxy
         reports "<proxy name> (<MAC>)" - so it is returned as-is.
         Appending the source again produced the doubled "(MAC) (MAC)" seen live.
+        """
+        scanner = self._scanner_holding_link()
+        return None if scanner is None else (scanner.name or scanner.source)
+
+    def _holding_node(self) -> str | None:
+        """Name the *node* holding the link, as its own firmware knows itself.
+
+        ``habluetooth`` builds a scanner's display name as
+        ``f"{adapter} ({source})"`` and keeps the bare adapter - for an ESPHome
+        proxy, the node's ``esphome: name:`` - in ``scanner.adapter``
+        (``habluetooth/base_scanner.py``: ``self.adapter = adapter``;
+        ``bleak_esphome`` passes ``device_info.name`` as that adapter). The node
+        name is what its actions are registered under, so acting on a proxy has
+        to start from this and not from the display name: parsing the address
+        back out of the display name would also break the moment a proxy is
+        renamed in Home Assistant, which does not rename the node.
+        """
+        scanner = self._scanner_holding_link()
+        return None if scanner is None else (scanner.adapter or None)
+
+    def _scanner_holding_link(self) -> Any | None:
+        """The scanner whose connection slots hold this device, if any does.
 
         The one entity whose job is to report on a broken link must not be the
         one that raises when the Bluetooth stack is gone, so a missing manager
@@ -606,7 +631,7 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             if allocations is None:
                 continue
             if any(held.upper() == address for held in allocations.allocated):
-                return scanner.name or scanner.source
+                return scanner
         return None
 
 

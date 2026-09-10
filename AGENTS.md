@@ -101,6 +101,18 @@ python3 -m py_compile custom_components/ecoflow_iot/**/*.py        # syntax
 python3 tests/test_registry.py                                     # import + SN resolution
 python3 tests/test_auth.py tests/test_commands.py tests/test_helpers.py  # unit (or pytest)
 python3 scripts/gen_device_docs.py                                 # docs in sync
+python3 -m pytest tests/test_repairs.py -q                          # repairs + unreachable countdown
 ```
+`tests/test_repairs.py` needs `pytest` and `voluptuous` (repairs.py builds a
+selector schema at import). Nothing else here does, so they are not installed
+repo-wide; on a box whose system Python predates 3.12 use an interpreter that
+understands PEP 695 aliases, e.g.
+```bash
+uv run --no-project --python 3.13 --with pytest --with voluptuous -- python -m pytest tests/test_repairs.py -q
+```
+`python3 -m pytest tests` (the whole directory) cannot work: several older test
+files call `sys.exit` at import, which pytest reports as
+`INTERNALERROR> SystemExit: 0`. Name the files, or run them the plain-python way
+above.
 `tests/test_registry.py` imports the whole device package under a fake `homeassistant`
 module and asserts each SN resolves to the right class with unique entity keys.
