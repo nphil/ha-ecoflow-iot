@@ -80,7 +80,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
         # heard again, so the countdown towards the unreachable repair is armed
         # from here. A device that was already gone when Home Assistant started
         # is the most complete outage there is, and it is the one a supervisor-
-        # owned countdown would silently never report.
+        # owned countdown would silently never report. Setup re-enters here on
+        # every retry; the clock behind the countdown is keyed by address and
+        # written once, so no retry - and no reload - pushes the deadline out.
         unreachable.async_reconcile(hass, entry, connected=False)
         raise ConfigEntryNotReady(
             translation_domain=DOMAIN,
@@ -159,6 +161,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) 
     _cancel_reappear_callback(hass, entry)
     # Nothing may outlive the entry: a countdown left armed would raise a repair
     # about a device nobody is holding, including one just disabled by hand.
+    # Only the timer goes; when the outage started is kept, so the setup a
+    # reload runs next resumes the same window rather than starting a new one.
     unreachable.async_cancel(hass, entry)
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     # An entry torn down before it finished setting up has no coordinator, and

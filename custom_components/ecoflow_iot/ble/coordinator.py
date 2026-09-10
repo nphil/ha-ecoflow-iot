@@ -23,7 +23,10 @@ walks the escalation ladder in ``repairs.py``. The supervisor keeps retrying
 underneath it either way, and the issue is deleted the moment a link comes up.
 That issue belongs to the config entry rather than to this class - see
 :mod:`.unreachable` - because a device already gone at startup never gets as
-far as a coordinator; all this class contributes is the health answer.
+far as a coordinator; all this class contributes is the health answer. The
+fifteen minutes are counted from the first drop, across every reload since, so
+a fresh instance built by the autoheal's five-minute reload sweep does not
+grant the fault a fresh window.
 """
 
 from __future__ import annotations

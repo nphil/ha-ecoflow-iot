@@ -478,7 +478,10 @@ What that costs, stated plainly:
   Bluetooth"*. Nothing has been given up at that point — the supervisor is still
   retrying underneath it — the repair exists because by then anything that heals this
   automatically has already had its chance. It **clears itself** the moment a link is
-  established, including across a reload of the entry.
+  established, including across a reload of the entry. The 15 minutes count from the
+  first drop and **survive reloads and setup retries** — an automation that reloads a
+  down entry every few minutes does not keep pushing the repair away — and a device
+  already absent when Home Assistant starts (entry stuck in *setup retry*) is timed too.
 - Its **Fix** button walks a recovery ladder, cheapest rung first. Every rung performs
   its action and then waits for the link before reporting back, so nothing claims
   success on the strength of having run:

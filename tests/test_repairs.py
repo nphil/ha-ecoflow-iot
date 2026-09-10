@@ -4,7 +4,7 @@ What is pinned here is the behaviour a user sees: which issues the registry ends
 holding, which rungs the fix flow offers, and what it leaves in the entry's options.
 Nothing asserts translated wording or the order in which internals were called.
 
-Three regressions in particular must stay fixed:
+Four regressions in particular must stay fixed:
 
 * An issue is *never* deleted on the strength of remembered state. Both reconciles
   run unconditionally at setup, so a repair cannot outlive the fault it describes
@@ -16,6 +16,10 @@ Three regressions in particular must stay fixed:
 * A device that never advertises at all fails setup before a coordinator exists,
   so the countdown belongs to the config entry: the most complete outage there is
   must not be the one nothing reports.
+* A reload must not restart the countdown. The household autoheal reloads a down
+  device's entry every 5 minutes for as long as it is down, so a countdown that
+  starts over on reload can never reach a 15-minute threshold - measured live on
+  2026-09-09 during a deliberate 21-minute outage, when the repair never came.
 
 Run: ``python3 -m pytest tests/test_repairs.py``
 """
@@ -27,6 +31,7 @@ import contextlib
 import enum
 import re
 import sys
+import time
 import types
 from pathlib import Path
 from typing import Any
@@ -45,6 +50,26 @@ FLOW_ABORT = "abort"
 
 # Timers armed through the stubbed `async_call_later`: [delay, action, cancelled].
 TIMERS: list[list[Any]] = []
+
+
+class FakeClock:
+    """``time.monotonic`` under test control; nothing here sleeps."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
+    fake = FakeClock()
+    monkeypatch.setattr(time, "monotonic", fake)
+    return fake
 
 
 def fire_timers() -> None:
@@ -592,6 +617,17 @@ def start_ble(
     return coordinator
 
 
+def reload_ble(hass: FakeHass, entry: FakeConfigEntry) -> EcoFlowBleCoordinator:
+    """Reload a loaded BLE entry the way ``homeassistant.reload_config_entry`` does.
+
+    Unload runs the integration's own unload (a loaded entry has one), which
+    is what takes an entry-scoped countdown with it; setup then builds a fresh
+    coordinator that has never seen the link.
+    """
+    assert asyncio.run(ble.async_unload_entry(hass, entry)) is True
+    return start_ble(hass, entry)
+
+
 def issue_ids(hass: FakeHass) -> set[str]:
     return {issue_id for _, issue_id in _registry(hass).issues}
 
@@ -644,16 +680,26 @@ def test_setup_arms_the_countdown_for_a_device_that_is_already_down():
     assert issue["translation_placeholders"]["device"] == "River 3 Pro"
 
 
-def test_a_link_inside_the_threshold_raises_nothing():
-    """Reconnecting before the threshold disarms the countdown entirely."""
+def test_a_link_inside_the_threshold_raises_nothing(clock: FakeClock):
+    """Reconnecting before the threshold disarms the countdown entirely.
+
+    And forgets when the link went down: the next outage is a new one and gets
+    the full window, not the remainder of the last.
+    """
     hass = new_hass()
     entry = hass.config_entries.add(ble_entry())
     coordinator = start_ble(hass, entry)
 
+    clock.advance(600)
     coordinator._set_connected(True)
     fire_timers()
 
     assert issue_ids(hass) == set()
+
+    clock.advance(600)
+    coordinator._set_connected(False)
+
+    assert armed_delays() == [BLE_UNREACHABLE_SECONDS]
 
 
 def test_reconnecting_deletes_the_repair():
@@ -686,17 +732,75 @@ def test_a_device_that_never_advertises_still_raises_the_repair():
     assert issue_ids(hass) == {ISSUE_ID}
 
 
-def test_setup_retries_do_not_push_the_deadline_out():
+def test_setup_retries_do_not_push_the_deadline_out(clock: FakeClock):
     """Home Assistant re-enters setup on every retry; the device has been gone
-    since the first one, which is the moment the operator cares about."""
+    since the first one, which is the moment the operator cares about.
+
+    That holds across the entry finally loading too: a device heard again but
+    not yet linked as setup completes keeps the deadline the first retry set.
+    """
     hass = new_hass()
     entry = hass.config_entries.add(ble_entry())
 
     for _ in range(4):
         with pytest.raises(ConfigEntryNotReady):
             asyncio.run(ble.async_setup_entry(hass, entry))
+        clock.advance(200)
 
     assert armed_delays() == [BLE_UNREACHABLE_SECONDS]
+
+    start_ble(hass, entry)
+
+    assert armed_delays() == [BLE_UNREACHABLE_SECONDS]
+    clock.advance(BLE_UNREACHABLE_SECONDS - 800)
+    fire_timers()
+    assert issue_ids(hass) == {ISSUE_ID}
+
+
+def test_reloads_inside_the_window_do_not_restart_the_countdown(clock: FakeClock):
+    """The failure measured live on 2026-09-09: the autoheal reloads a down
+    device's entry every 5 minutes, and each reload built a fresh countdown.
+
+        22:24:37  link drop       -> countdown armed
+        22:35:00  autoheal reload -> countdown restarted at zero
+        22:40:00  autoheal reload -> countdown restarted at zero
+
+    The repair must still be raised 15 minutes after the FIRST drop.
+    """
+    hass = new_hass()
+    entry = hass.config_entries.add(ble_entry())
+    coordinator = start_ble(hass, entry, connected=True)
+
+    coordinator._set_connected(False)
+    assert armed_delays() == [BLE_UNREACHABLE_SECONDS]
+
+    for _ in range(2):
+        clock.advance(300)
+        reload_ble(hass, entry)
+
+    # 10 minutes into the outage: 5 remain, not a fresh 15.
+    assert armed_delays() == [BLE_UNREACHABLE_SECONDS - 600]
+    assert issue_ids(hass) == set()
+
+    clock.advance(BLE_UNREACHABLE_SECONDS - 600)
+    fire_timers()
+
+    assert issue_ids(hass) == {ISSUE_ID}
+
+
+def test_a_reload_after_the_threshold_raises_at_once(clock: FakeClock):
+    """A device down longer than the window when its entry reloads gets no
+    further grace: the countdown already ran out, whoever was holding it."""
+    hass = new_hass()
+    entry = hass.config_entries.add(ble_entry())
+    coordinator = start_ble(hass, entry, connected=True)
+    coordinator._set_connected(False)
+
+    clock.advance(BLE_UNREACHABLE_SECONDS + 60)
+    reload_ble(hass, entry)
+
+    assert issue_ids(hass) == {ISSUE_ID}
+    assert armed_delays() == []
 
 
 def test_unloading_leaves_no_countdown_behind():
@@ -774,7 +878,11 @@ def cloud_coordinator(hass: FakeHass, entry: FakeConfigEntry, serials: list[str]
 
 
 def test_cloud_entry_raises_no_unreachable_repair():
-    """The unreachable repair belongs to the Bluetooth transport alone."""
+    """The unreachable repair belongs to the Bluetooth transport alone.
+
+    No issue, no countdown, and no outage clock either: the clock is keyed by
+    Bluetooth address and a cloud entry has none.
+    """
     hass = new_hass()
     entry = hass.config_entries.add(cloud_entry())
 
@@ -782,6 +890,7 @@ def test_cloud_entry_raises_no_unreachable_repair():
 
     assert issue_ids(hass) == {"unsupported_device_R351"}
     assert armed_delays() == []
+    assert not hass.data.get(unreachable.DOWN_SINCE_KEY)
 
 
 def test_setup_deletes_the_repair_of_a_device_that_is_now_supported(monkeypatch):
