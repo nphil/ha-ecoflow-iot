@@ -471,6 +471,32 @@ What that costs, stated plainly:
   when the link is down their entities are unavailable. Nothing substitutes cloud data for
   them.
 
+### When it stays down
+
+- After **15 continuous minutes with no link**, the integration raises a **repair**
+  (Settings → Devices & Services → **Repairs**): *"<device> is unreachable over
+  Bluetooth"*. Nothing has been given up at that point — the supervisor is still
+  retrying underneath it — the repair exists because by then anything that heals this
+  automatically has already had its chance. It **clears itself** the moment a link is
+  established, including across a reload of the entry.
+- Its **Fix** button walks a recovery ladder, cheapest rung first. Every rung performs
+  its action and then waits for the link before reporting back, so nothing claims
+  success on the strength of having run:
+  1. **Check again** — changes nothing; the supervisor may be mid-attempt.
+  2. **Reload the integration** — rebuilds the entry, and with it the link, from nothing.
+  3. **Restart the Bluetooth proxy** — offered only when the proxy that holds (or last
+     held) the link is an ESPHome node exposing a `restart_proxy` action. That firmware
+     **refuses to restart inside its first ~20 minutes of uptime**, and the action
+     reports success either way, so this rung may legitimately do nothing — it says as
+     much rather than claiming a reboot it cannot verify.
+  4. **Power-cycle the device** — last resort: switches a `switch` entity of your choice
+     off, waits 10 seconds and switches it back on, **cutting the device's mains
+     supply**. The outlet you pick is remembered for next time, and closing the dialog
+     mid-cut does not leave the device dark — the switch goes back on regardless.
+- While the link is up, the proxy holding it is recorded in the entry's options
+  (`last_holding_proxy`). An unreachable device has no holding proxy left to discover,
+  so without that record there would be nothing for rung 3 to act on.
+
 ## How data flows
 
 **Cloud entries**

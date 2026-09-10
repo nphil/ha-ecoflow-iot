@@ -16,8 +16,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.importlib import async_import_module
 from homeassistant.util import dt as dt_util
 
-from . import EcoFlowConfigEntry, is_ble_entry
-from .const import DATA_RESET_ENERGY_IDS, DOMAIN
+from . import EcoFlowConfigEntry
+from .const import DATA_RESET_ENERGY_IDS, DOMAIN, is_ble_entry
 from .coordinator import EcoFlowCoordinator
 from .devices.base import (
     EcoFlowIntegralSensorEntityDescription,

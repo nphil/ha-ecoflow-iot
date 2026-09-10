@@ -39,6 +39,7 @@ from ..const import (
     DEFAULT_UPDATE_PERIOD,
     DOMAIN,
 )
+from . import unreachable
 from .coordinator import EcoFlowBleCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -75,6 +76,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
         # rather than poll, watch for the next advertisement and retry then;
         # Home Assistant's own setup backoff is the fallback.
         _register_reappear_callback(hass, entry, address)
+        # No coordinator exists on this path and none will until the device is
+        # heard again, so the countdown towards the unreachable repair is armed
+        # from here. A device that was already gone when Home Assistant started
+        # is the most complete outage there is, and it is the one a supervisor-
+        # owned countdown would silently never report.
+        unreachable.async_reconcile(hass, entry, connected=False)
         raise ConfigEntryNotReady(
             translation_domain=DOMAIN,
             translation_key="device_not_present",
@@ -150,6 +157,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
 async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> bool:
     """Tear the entry down, releasing the link whether or not platforms unload."""
     _cancel_reappear_callback(hass, entry)
+    # Nothing may outlive the entry: a countdown left armed would raise a repair
+    # about a device nobody is holding, including one just disabled by hand.
+    unreachable.async_cancel(hass, entry)
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     # An entry torn down before it finished setting up has no coordinator, and
     # an unload that raised there would leave the entry stuck in FAILED_UNLOAD.
@@ -159,8 +169,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) 
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> None:
-    """Drop the advertisement watch a never-loaded entry may have left behind."""
+    """Drop what a removed entry would otherwise leave behind it.
+
+    The advertisement watch a never-loaded entry may still hold, and its
+    unreachable repair along with any countdown towards one.
+    """
     _cancel_reappear_callback(hass, entry)
+    unreachable.async_clear(hass, entry)
 
 
 async def _async_options_updated(

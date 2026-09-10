@@ -16,6 +16,14 @@ Deliberate non-behaviours, each of which cost this house time before:
 * A failed attempt never escalates into a config entry reload. The supervisor
   backs off and retries forever; Home Assistant is only told the entry needs
   attention when the *credentials* are wrong, which retrying cannot fix.
+
+What retrying forever cannot do is tell anyone, so a link that has been down
+continuously for fifteen minutes raises a fixable repair issue whose Fix button
+walks the escalation ladder in ``repairs.py``. The supervisor keeps retrying
+underneath it either way, and the issue is deleted the moment a link comes up.
+That issue belongs to the config entry rather than to this class - see
+:mod:`.unreachable` - because a device already gone at startup never gets as
+far as a coordinator; all this class contributes is the health answer.
 """
 
 from __future__ import annotations
@@ -47,19 +55,18 @@ from ..const import (
     BLE_DROP_WINDOW_SECONDS,
     BLE_READY_TIMEOUT,
     BLE_SETUP_READY_WAIT,
+    CONF_LAST_HOLDING_PROXY,
     DEFAULT_UPDATE_PERIOD,
     DOMAIN,
+    LINK_DISCONNECTED,
     MANUFACTURER,
 )
 from ..eflib import DeviceBase
 from ..eflib.connection import Connection
 from ..eflib.exceptions import AuthErrors
+from . import unreachable
 
 _LOGGER = logging.getLogger(__name__)
-
-# State reported by the connection diagnostic while no link is held. The house
-# automations match on this exact string, so it is not a translated value.
-LINK_DISCONNECTED = "disconnected"
 
 # Authentication failures retrying cannot fix: the device is telling us the
 # account behind the user ID is wrong, stale or not entitled to this unit. Every
@@ -163,11 +170,21 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         )
 
     @property
+    def holding_scanner(self) -> str | None:
+        """Name of the proxy holding the link, or ``None`` if none holds it.
+
+        Unlike :attr:`link_state` this never substitutes a word for a name, so
+        a caller that wants to *act* on the proxy - the recovery flow deriving
+        an ESPHome action from it - cannot mistake "connected" for a node.
+        """
+        return self._holding_scanner() if self._connected else None
+
+    @property
     def link_state(self) -> str:
         """Name of the proxy holding the link, or ``"disconnected"``."""
         if not self._connected:
             return LINK_DISCONNECTED
-        return self._holding_scanner() or "connected"
+        return self.holding_scanner or "connected"
 
     @property
     def link_attributes(self) -> dict[str, Any]:
@@ -226,6 +243,13 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
                 self.device_name,
                 BLE_SETUP_READY_WAIT,
             )
+        # Reconciled here, unconditionally, as well as on every health
+        # transition: a reload re-enters this line, and that is what stops a
+        # repair from outliving the fault it describes. Gating the delete on a
+        # remembered "we raised it" flag is how a sibling integration left an
+        # issue raised at 12:22 open 13 hours after the fault cleared at 13:00
+        # - the entry reloaded at 12:38 and took the flag with it (2026-09-09).
+        self.reconcile_unreachable_issue()
         return self._auth_error
 
     async def async_stop(self) -> None:
@@ -450,6 +474,46 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         self._set_connected(False)
         await self._safe_disconnect()
 
+    # -- unreachable repair -----------------------------------------------------
+
+    @callback
+    def reconcile_unreachable_issue(self) -> None:
+        """Make the unreachable repair match this link, gating the delete on nothing.
+
+        The reconcile itself belongs to the config entry (see
+        :mod:`.unreachable`): a device that was already gone when Home Assistant
+        started never gets as far as a coordinator, so the countdown cannot live
+        on one. All this adds is the health answer, which only a coordinator has.
+        """
+        if not self._hold:
+            # Unloaded, or never started. Nothing here may outlive the entry:
+            # not a timer, and not a verdict on a link we stopped supervising.
+            return
+        unreachable.async_reconcile(
+            self.hass, self.config_entry, connected=self._connected
+        )
+
+    @callback
+    def _remember_holding_proxy(self) -> None:
+        """Persist the proxy holding the link, for the recovery flow to act on.
+
+        A device that has gone away has no holding scanner, so by the time the
+        wizard wants to restart the proxy in front of it there is nothing left
+        to discover: whichever one was holding the link is the only candidate.
+        Written only when it changed - every options write wakes the entry's
+        update listener, and a link flapping between two proxies would
+        otherwise rewrite the entry on each reconnect.
+        """
+        scanner = self._holding_scanner()
+        if not scanner:
+            return
+        if self.config_entry.options.get(CONF_LAST_HOLDING_PROXY) == scanner:
+            return
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            options={**self.config_entry.options, CONF_LAST_HOLDING_PROXY: scanner},
+        )
+
     # -- internals --------------------------------------------------------------
 
     async def _async_update_data(self) -> None:
@@ -506,6 +570,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         # Availability follows the real link, so a coordinator that has never
         # had a successful frame still reports unavailable rather than empty.
         self.last_update_success = connected
+        if connected:
+            self._remember_holding_proxy()
+        self.reconcile_unreachable_issue()
         self.async_update_listeners()
 
     def _record_drop(self) -> None:

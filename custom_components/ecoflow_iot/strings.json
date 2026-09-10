@@ -1,5 +1,37 @@
 {
   "issues": {
+    "device_unreachable": {
+      "title": "{device} is unreachable over Bluetooth",
+      "description": "Home Assistant has had no Bluetooth link to {device} ({address}) for at least {minutes} minutes. The integration is still retrying in the background and will reconnect on its own the moment the device is reachable again, so this repair only appears once that — and any healing automations you run — has already had its chance.\n\nSelecting **Fix** offers the recovery steps in order of how disruptive they are, from simply looking again to cutting the device's mains power. This repair disappears by itself as soon as a link is established, whether you fixed it here or the device simply came back.",
+      "fix_flow": {
+        "step": {
+          "menu": {
+            "title": "Recover {device}",
+            "description": "Link state: **{link}**\nProxy that last held the link: **{proxy}**\n\nWork down the list: each step is more disruptive than the one above it, and every step waits up to a minute for the link to come back before telling you what happened. Nothing here is needed if the device simply comes back on its own — the integration never stops retrying.\n\n{last_result}",
+            "menu_options": {
+              "recheck": "Just check again (changes nothing)",
+              "reload": "Reload the integration (cheapest fix)",
+              "restart_proxy": "Restart the Bluetooth proxy that holds this device",
+              "power_cycle": "Power-cycle the device (last resort — cuts mains)"
+            }
+          },
+          "power_cycle": {
+            "title": "Power-cycle {device}",
+            "description": "Last resort. This switches the chosen outlet **off, waits 10 seconds, and switches it back on**, cutting mains power to {device} — anything it is powering goes with it, and the device reboots. Only worth doing when the device itself has stopped answering rather than the proxy in front of it.\n\nThe outlet you pick is remembered for next time. Closing this dialog while the power is off does not leave it off: the switch is turned back on regardless.\n\nLink state: **{link}**\n\n{last_result}",
+            "data": {
+              "recovery_outlet": "Outlet switch"
+            },
+            "data_description": {
+              "recovery_outlet": "The switch that controls this device's mains supply — a smart plug or a socket on a power strip. It is turned off and back on as-is, so make sure nothing else you care about is on the same outlet."
+            }
+          }
+        },
+        "abort": {
+          "entry_gone": "That device is no longer configured in Home Assistant, so there is nothing left to recover. The repair can be dismissed.",
+          "not_loaded": "This device's configuration entry is not in a state these steps can act on — it is disabled, or it failed to set up for a reason reconnecting cannot fix (for example the device at that address now reports a different serial number). Open the integration's page and deal with the error shown there first."
+        }
+      }
+    },
     "unsupported_device": {
       "title": "Unsupported EcoFlow device ({prefix})",
       "description": "An EcoFlow device with serial prefix `{prefix}` is bound to your account but is not supported yet by this integration, so no entities were created for it. Only the prefix is shown for privacy. To help add support, download this integration's diagnostics (Settings → Devices & Services → EcoFlow IoT → the ⋮ menu → Download diagnostics) — they include the device's raw data under `unmapped_devices` with the serial number removed — and open an issue on the project's GitHub repository including this prefix and the attached diagnostics."

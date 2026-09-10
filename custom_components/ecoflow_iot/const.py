@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Final
+from typing import TYPE_CHECKING, Final
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
 
 DOMAIN: Final = "ecoflow_iot"
 
@@ -17,6 +20,21 @@ CONF_REGION: Final = "region"
 CONF_TRANSPORT: Final = "transport"
 TRANSPORT_CLOUD: Final = "cloud"
 TRANSPORT_BLE: Final = "ble"
+
+
+def is_ble_entry(entry: ConfigEntry) -> bool:
+    """Whether this entry is served by the local Bluetooth transport.
+
+    Entries created before local Bluetooth existed carry no transport at all,
+    which is why the cloud path is the absence of a marker rather than its own.
+
+    Lives here rather than beside the setup it guards so that asking the
+    question costs nothing: ``repairs.py`` has to know which transport an entry
+    uses, and importing the package root for it would pull in the cloud
+    coordinator and the HTTP stack on a Bluetooth-only install.
+    """
+    return entry.data.get(CONF_TRANSPORT) == TRANSPORT_BLE
+
 
 # BLE entry keys (transport == TRANSPORT_BLE)
 CONF_ADDRESS: Final = "address"
@@ -62,6 +80,14 @@ BLE_COMMAND_TIMEOUT: Final = 15.0
 # Outer bound on releasing a link. Bleak's own disconnect is already capped, but
 # a wedged transport can stall inside it and unload must never hang on that.
 BLE_DISCONNECT_TIMEOUT: Final = 8.0
+# How long the link must be continuously down before the operator is told about
+# it with a repair issue. Long enough that the house's own healing has had its
+# turn - the hourly re-home and script.ble_heal_device both act well inside it -
+# so the repair only ever appears once that machinery has already failed.
+BLE_UNREACHABLE_SECONDS: Final = 900.0
+# State reported by the connection diagnostic while no link is held. The house
+# automations match on this exact string, so it is not a translated value.
+LINK_DISCONNECTED: Final = "disconnected"
 
 # Options keys
 CONF_POLL_INTERVAL: Final = "poll_interval"
@@ -77,6 +103,13 @@ CONF_RESET_GRID_ENERGY: Final = "reset_grid_energy"
 RESET_ENERGY_KEYS: Final = ("grid_import_energy", "grid_export_energy")
 # hass.data slot holding the set of entity unique_ids queued for reset.
 DATA_RESET_ENERGY_IDS: Final = "reset_energy_ids"
+# Name of the scanner that last held the BLE link. An unreachable device has no
+# holding scanner to discover, so the proxy that was holding it is remembered
+# while the link is up - it is the only candidate the recovery flow has left.
+CONF_LAST_HOLDING_PROXY: Final = "last_holding_proxy"
+# Switch entity the recovery flow power-cycles, remembered from the last run so
+# the operator picks their outlet once rather than on every escalation.
+CONF_RECOVERY_OUTLET: Final = "recovery_outlet"
 
 # Regions -> REST base URL.
 REGION_EU: Final = "eu"
@@ -140,6 +173,22 @@ def redact_sn(sn: str) -> str:
     if len(sn) <= SN_PREFIX_LEN + 3:
         return sn[:SN_PREFIX_LEN] + "…"
     return f"{sn[:SN_PREFIX_LEN]}…{sn[-3:]}"
+
+
+# Repair issue ids, derived and never remembered: code that has to decide
+# whether an issue should exist can name it from the thing it describes, which
+# is what makes an unconditional create/delete reconciliation possible.
+UNSUPPORTED_ISSUE_PREFIX: Final = "unsupported_device_"
+
+
+def unreachable_issue_id(address: str) -> str:
+    """Issue id for one Bluetooth device's unreachable repair.
+
+    Keyed on the address rather than the entry id so the repair a user is
+    looking at survives the entry being removed and added back, and so the fix
+    flow can find its entry from the issue id alone.
+    """
+    return f"{address.replace(':', '').upper()}_unreachable"
 
 # quota/all business code for devices the open API refuses to serve at all
 # ("current device is not allowed to get device info"), e.g. Delta Mini, River 2.

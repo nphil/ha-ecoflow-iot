@@ -28,7 +28,6 @@ from .const import (
     CONF_MQTT_STALE_SECONDS,
     CONF_REGION,
     CONF_SECRET_KEY,
-    CONF_TRANSPORT,
     DEFAULT_ENABLE_MQTT,
     DEFAULT_MQTT_INSECURE_TLS,
     DEFAULT_MQTT_REFRESH_INTERVAL,
@@ -36,7 +35,7 @@ from .const import (
     DEFAULT_POLL_INTERVAL,
     DEFAULT_REGION,
     DOMAIN,
-    TRANSPORT_BLE,
+    is_ble_entry,
 )
 from .coordinator import EcoFlowCoordinator
 
@@ -54,15 +53,6 @@ PLATFORMS: list[Platform] = [
 ]
 
 type EcoFlowConfigEntry = ConfigEntry[EcoFlowCoordinator]
-
-
-def is_ble_entry(entry: ConfigEntry) -> bool:
-    """Whether this entry is served by the local Bluetooth transport.
-
-    Entries created before local Bluetooth existed carry no transport at all,
-    which is why the cloud path is the absence of a marker rather than its own.
-    """
-    return entry.data.get(CONF_TRANSPORT) == TRANSPORT_BLE
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:

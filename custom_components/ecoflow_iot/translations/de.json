@@ -1,5 +1,37 @@
 {
   "issues": {
+    "device_unreachable": {
+      "title": "{device} ist über Bluetooth nicht erreichbar",
+      "description": "Home Assistant hat seit mindestens {minutes} Minuten keine Bluetooth-Verbindung zu {device} ({address}). Die Integration versucht es im Hintergrund weiterhin und verbindet sich von selbst wieder, sobald das Gerät erreichbar ist — diese Reparatur erscheint also erst, wenn das (und etwaige eigene Automatisierungen) bereits gescheitert ist.\n\n**Reparieren** bietet die Wiederherstellungsschritte in der Reihenfolge ihrer Eingriffstiefe an, von einem erneuten Blick bis zum Trennen der Netzspannung. Diese Reparatur verschwindet von selbst, sobald eine Verbindung besteht — ganz gleich, ob Sie sie hier behoben haben oder das Gerät einfach zurückgekommen ist.",
+      "fix_flow": {
+        "step": {
+          "menu": {
+            "title": "{device} wiederherstellen",
+            "description": "Verbindungsstatus: **{link}**\nZuletzt haltender Proxy: **{proxy}**\n\nArbeiten Sie die Liste von oben nach unten ab: jeder Schritt greift tiefer ein als der darüber, und jeder wartet bis zu eine Minute auf die Verbindung, bevor er berichtet. Nichts davon ist nötig, wenn das Gerät von selbst zurückkommt — die Integration versucht es unablässig weiter.\n\n{last_result}",
+            "menu_options": {
+              "recheck": "Nur erneut prüfen (ändert nichts)",
+              "reload": "Integration neu laden (günstigster Eingriff)",
+              "restart_proxy": "Bluetooth-Proxy dieses Geräts neu starten",
+              "power_cycle": "Gerät stromlos schalten (letztes Mittel — trennt die Netzspannung)"
+            }
+          },
+          "power_cycle": {
+            "title": "{device} stromlos schalten",
+            "description": "Letztes Mittel. Die gewählte Steckdose wird **ausgeschaltet, 10 Sekunden gewartet und wieder eingeschaltet** — damit wird die Netzspannung von {device} getrennt, alles daran Angeschlossene geht mit, und das Gerät startet neu. Nur sinnvoll, wenn das Gerät selbst nicht mehr antwortet und nicht der Proxy davor.\n\nDie gewählte Steckdose wird für das nächste Mal gemerkt. Wenn Sie diesen Dialog schließen, während der Strom aus ist, bleibt er nicht aus: der Schalter wird in jedem Fall wieder eingeschaltet.\n\nVerbindungsstatus: **{link}**\n\n{last_result}",
+            "data": {
+              "recovery_outlet": "Schalter der Steckdose"
+            },
+            "data_description": {
+              "recovery_outlet": "Der Schalter, der die Netzversorgung dieses Geräts steuert — eine smarte Steckdose oder eine Buchse einer Steckdosenleiste. Er wird unverändert aus- und wieder eingeschaltet; achten Sie darauf, dass nichts anderes Wichtiges daran hängt."
+            }
+          }
+        },
+        "abort": {
+          "entry_gone": "Dieses Gerät ist in Home Assistant nicht mehr konfiguriert, es gibt also nichts wiederherzustellen. Die Reparatur kann verworfen werden.",
+          "not_loaded": "Der Konfigurationseintrag dieses Geräts ist in einem Zustand, in dem diese Schritte nicht greifen — er ist deaktiviert, oder die Einrichtung ist aus einem Grund gescheitert, den ein Neuverbinden nicht behebt (etwa weil das Gerät an dieser Adresse jetzt eine andere Seriennummer meldet). Öffnen Sie zuerst die Seite der Integration und beheben Sie den dort gezeigten Fehler."
+        }
+      }
+    },
     "unsupported_device": {
       "title": "Nicht unterstütztes EcoFlow-Gerät ({prefix})",
       "description": "Ein EcoFlow-Gerät mit dem Seriennummern-Präfix `{prefix}` ist mit Ihrem Konto verknüpft, wird von dieser Integration aber noch nicht unterstützt, daher wurden keine Entitäten dafür erstellt. Aus Datenschutzgründen wird nur das Präfix angezeigt. Um die Unterstützung voranzubringen, laden Sie die Diagnosedaten dieser Integration herunter (Einstellungen → Geräte & Dienste → EcoFlow IoT → Menü ⋮ → Diagnose herunterladen) — sie enthalten unter `unmapped_devices` die Rohdaten des Geräts ohne Seriennummer — und erstellen Sie ein Issue im GitHub-Repository des Projekts mit diesem Präfix und den angehängten Diagnosedaten."

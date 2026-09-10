@@ -42,7 +42,6 @@ from homeassistant.helpers.selector import (
 from homeassistant.helpers.importlib import async_import_module
 from homeassistant.helpers.storage import Store
 
-from . import is_ble_entry
 from .api import EcoFlowAuthError, EcoFlowConnectionError, EcoFlowError, EcoFlowHttpClient
 from .const import (
     CONF_ACCESS_KEY,
@@ -80,6 +79,7 @@ from .const import (
     REGION_GLOBAL,
     RESET_ENERGY_KEYS,
     TRANSPORT_BLE,
+    is_ble_entry,
 )
 
 _REGION_OPTIONS = [
@@ -506,8 +506,16 @@ class EcoFlowBleOptionsFlow(OptionsFlow):
     ) -> ConfigFlowResult:
         """Set how often the device is asked to report."""
         if user_input is not None:
+            # Merged, not replaced: options also carry state this form knows
+            # nothing about - the proxy that last held the link and the outlet
+            # the recovery flow power-cycles - and saving the one visible knob
+            # must not throw those away.
             return self.async_create_entry(
-                title="", data={CONF_UPDATE_PERIOD: int(user_input[CONF_UPDATE_PERIOD])}
+                title="",
+                data={
+                    **self.config_entry.options,
+                    CONF_UPDATE_PERIOD: int(user_input[CONF_UPDATE_PERIOD]),
+                },
             )
 
         return self.async_show_form(

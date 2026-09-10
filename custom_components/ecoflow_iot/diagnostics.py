@@ -7,8 +7,13 @@ from typing import Any
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
-from . import EcoFlowConfigEntry, is_ble_entry
-from .const import CONF_ACCESS_KEY, CONF_SECRET_KEY, SN_PREFIX_LEN
+from . import EcoFlowConfigEntry
+from .const import (
+    CONF_ACCESS_KEY,
+    CONF_SECRET_KEY,
+    SN_PREFIX_LEN,
+    is_ble_entry,
+)
 
 TO_REDACT = {
     CONF_ACCESS_KEY,

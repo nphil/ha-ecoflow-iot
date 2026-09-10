@@ -40,6 +40,8 @@ from .const import (
     OPERATE_LATEST_QUOTAS,
     SET_ACK_TIMEOUT,
     SN_PREFIX_LEN,
+    UNSUPPORTED_ISSUE_PREFIX,
+    is_ble_entry,
     redact_sn,
 )
 from .devices import EcoFlowDevice, is_silenced, resolve_device
@@ -90,6 +92,10 @@ class EcoFlowCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
         # or a smart plug excluded by the opt-in option. Their raw quota is kept
         # so it can be surfaced in diagnostics for future entity mapping.
         self.unmapped: dict[str, DeviceState] = {}
+        # Serial prefixes of this account's unsupported devices, as of the last
+        # discovery pass. The repairs are reconciled against this set, so it is
+        # the answer to "should there be an issue", not a record of raising one.
+        self.unsupported_prefixes: set[str] = set()
         # Serials that expose at least one http_only entity (refreshed over HTTP
         # on the poll interval even while MQTT is connected).
         self._http_only_sns: set[str] = set()
@@ -108,19 +114,51 @@ class EcoFlowCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
         return self._mqtt.broker if self._mqtt else None
 
     @callback
-    def _notify_unsupported(self, sn: str) -> None:
-        """Raise a repair issue for an unsupported device (prefix only)."""
+    def _note_unsupported(self, sn: str) -> None:
+        """Record an unsupported device (prefix only); the reconcile raises it."""
         prefix = sn[:SN_PREFIX_LEN]
         _LOGGER.warning("Unsupported EcoFlow device with serial prefix %s", prefix)
-        ir.async_create_issue(
-            self.hass,
-            DOMAIN,
-            f"unsupported_device_{prefix}",
-            is_fixable=False,
-            severity=ir.IssueSeverity.WARNING,
-            translation_key="unsupported_device",
-            translation_placeholders={"prefix": prefix},
-        )
+        self.unsupported_prefixes.add(prefix)
+
+    @callback
+    def reconcile_unsupported_issues(self) -> None:
+        """Make the unsupported-device repairs match what the accounts now hold.
+
+        Create and delete are both unconditional, decided only by what the last
+        device list contained. There used to be no delete path at all, so an
+        issue outlived everything that could clear it: a device gaining support
+        in an update, or leaving the account entirely, left the repair open
+        forever. Gating the delete on a remembered "we raised it" would be no
+        better - that memory dies with every entry reload.
+        """
+        wanted = set(self.unsupported_prefixes)
+        for entry in self.hass.config_entries.async_entries(DOMAIN):
+            # A prefix is a property of the device type rather than of an
+            # account, but two accounts can hold the same unsupported model, so
+            # every other loaded cloud entry gets a say before a delete.
+            if entry.entry_id == self.config_entry.entry_id or is_ble_entry(entry):
+                continue
+            other = getattr(entry, "runtime_data", None)
+            if isinstance(other, EcoFlowCoordinator):
+                wanted |= other.unsupported_prefixes
+
+        registry = ir.async_get(self.hass)
+        for domain, issue_id in list(registry.issues):
+            if domain != DOMAIN or not issue_id.startswith(UNSUPPORTED_ISSUE_PREFIX):
+                continue
+            if issue_id.removeprefix(UNSUPPORTED_ISSUE_PREFIX) not in wanted:
+                ir.async_delete_issue(self.hass, DOMAIN, issue_id)
+
+        for prefix in wanted:
+            ir.async_create_issue(
+                self.hass,
+                DOMAIN,
+                f"{UNSUPPORTED_ISSUE_PREFIX}{prefix}",
+                is_fixable=False,
+                severity=ir.IssueSeverity.WARNING,
+                translation_key="unsupported_device",
+                translation_placeholders={"prefix": prefix},
+            )
 
     async def async_setup(self) -> None:
         """Discover devices, seed data over HTTP and start MQTT."""
@@ -159,7 +197,7 @@ class EcoFlowCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
                 # are skipped silently. Genuinely unknown devices raise a repair
                 # so support can be added.
                 if not not_served and not is_silenced(sn):
-                    self._notify_unsupported(sn)
+                    self._note_unsupported(sn)
                 self.unmapped[sn] = state
                 continue
             self.devices[sn] = device
@@ -169,6 +207,10 @@ class EcoFlowCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
         self._http_only_sns = {
             sn for sn, dev in self.devices.items() if dev.has_http_only_entities()
         }
+        # Every path out of a successful device list runs this, so a reload is
+        # all it takes for the repairs to catch up with reality - which is the
+        # only place they are ever decided.
+        self.reconcile_unsupported_issues()
         if not self.devices:
             if self.unmapped:
                 # Everything on the account was unsupported or an excluded plug;

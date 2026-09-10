@@ -10,7 +10,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.importlib import async_import_module
 
-from . import EcoFlowConfigEntry, is_ble_entry
+from . import EcoFlowConfigEntry
+from .const import is_ble_entry
 from .devices.base import EcoFlowSwitchEntityDescription
 from .entity import EcoFlowEntity
 
