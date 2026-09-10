@@ -6,9 +6,9 @@ import logging
 from pathlib import Path
 
 from homeassistant.components.http import StaticPathConfig
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
@@ -38,6 +38,9 @@ from .const import (
     is_ble_entry,
 )
 from .coordinator import EcoFlowCoordinator
+import contextlib
+import voluptuous as vol
+from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +60,7 @@ type EcoFlowConfigEntry = ConfigEntry[EcoFlowCoordinator]
 
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
     """Set up EcoFlow IoT from a config entry."""
+    _async_register_services(hass)
     if is_ble_entry(entry):
         # Loaded through the executor: a cloud-only installation never loads
         # the Bluetooth stack at all, and importing it - which pulls in
@@ -207,3 +211,81 @@ async def _async_add_resource(hass: HomeAssistant, retries: int = 12) -> None:
             _LOGGER.info("Updated the EcoFlow Energy card resource to %s", url)
     except Exception:  # noqa: BLE001 - the card is optional, never block setup
         _LOGGER.exception("Could not register the EcoFlow Energy card resource")
+
+
+# ---------------------------------------------------------------------------
+# release_link - clean teardown before Home Assistant goes away
+# ---------------------------------------------------------------------------
+#
+# Home Assistant does NOT unload config entries on shutdown: it fires
+# EVENT_HOMEASSISTANT_STOP and the `bluetooth` integration tears its stack down
+# concurrently, so held GATT links die without a completed disconnect. The
+# peripheral keeps believing it is connected, stops advertising, and answers
+# nobody - a ghost link Home Assistant cannot see because the proxy reports its
+# slots free (measured 2026-09-09/10: an HA restart wedged three devices; only
+# rebooting the proxy holding each stale link freed them).
+#
+# The proxies now release their links themselves 25 s after losing their API
+# client, which covers every way HA can vanish including a crash or a power
+# cut. This action is the cooperative path for the case HA *is* still running:
+# it releases the link before the restart rather than during it. Implemented by
+# unloading the entry, because the BLE coordinator's async_stop (run by async_unload_entry) cancels the link
+# supervisor before releasing, so the release cannot be observed as a drop and
+# reconnected behind us. Cloud entries are skipped: they hold no BLE link.
+#
+# `resume_after` sets the entry up again if no restart follows, so an operator
+# who calls this and changes their mind is not left with a dead device that
+# would raise its own unreachable repair a quarter of an hour later.
+SERVICE_RELEASE_LINK = "release_link"
+ATTR_RESUME_AFTER = "resume_after"
+DEFAULT_RESUME_AFTER = 180
+RELEASE_LINK_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_RESUME_AFTER, default=DEFAULT_RESUME_AFTER): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=900)
+        )
+    }
+)
+
+
+async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
+    """Unload every loaded entry, then set them up again if nothing restarts."""
+    released = [
+        entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.state is ConfigEntryState.LOADED and entry.data.get(CONF_TRANSPORT) == TRANSPORT_BLE
+    ]
+    for entry in released:
+        with contextlib.suppress(Exception):
+            await hass.config_entries.async_unload(entry.entry_id)
+        _LOGGER.info("Released the Bluetooth link held for %s", entry.title)
+
+    if not released or resume_after <= 0:
+        return
+
+    async def _resume(_now: Any) -> None:
+        for entry in released:
+            if entry.state is ConfigEntryState.LOADED:
+                continue  # something set it up already; it owns itself now
+            with contextlib.suppress(Exception):
+                await hass.config_entries.async_setup(entry.entry_id)
+        _LOGGER.info(
+            "No restart followed release_link within %s s; links re-established",
+            resume_after,
+        )
+
+    async_call_later(hass, resume_after, _resume)
+
+
+@callback
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register the domain action once, however many devices are configured."""
+    if hass.services.has_service(DOMAIN, SERVICE_RELEASE_LINK):
+        return
+
+    async def _handle(call: ServiceCall) -> None:
+        await _async_release_links(hass, call.data[ATTR_RESUME_AFTER])
+
+    hass.services.async_register(
+        DOMAIN, SERVICE_RELEASE_LINK, _handle, schema=RELEASE_LINK_SCHEMA
+    )
