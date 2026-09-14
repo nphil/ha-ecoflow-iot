@@ -189,7 +189,7 @@ def _async_raise(hass: HomeAssistant, entry: ConfigEntry, issue_id: str) -> None
         hass,
         DOMAIN,
         issue_id,
-        is_fixable=True,
+        is_fixable=False,
         severity=ir.IssueSeverity.WARNING,
         translation_key="device_unreachable",
         translation_placeholders={
