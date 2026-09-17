@@ -225,10 +225,14 @@ async def _async_add_resource(hass: HomeAssistant, retries: int = 12) -> None:
 # slots free (measured 2026-09-09/10: an HA restart wedged three devices; only
 # rebooting the proxy holding each stale link freed them).
 #
-# The proxies now release their links themselves 25 s after losing their API
-# client, which covers every way HA can vanish including a crash or a power
-# cut. This action is the cooperative path for the case HA *is* still running:
-# it releases the link before the restart rather than during it. Implemented by
+# Nothing on the proxy side covers this any more: ESPHome 2026.09.14 removed the
+# on-API-loss release hook, and rebooting a proxy is not a cure either - it
+# re-rolls the dice (2026-09-17: 2 of 6 proxies re-ghosted on their first
+# post-reboot connection). The only clean path is to drop the link while HA and
+# its Bluetooth stack are both still alive, which is what this action does:
+# `script.safe_restart` calls it on every BLE integration and only then restarts
+# Core. A ghost that forms anyway is caught by `automation.ble_ghost_link_detector`
+# and freed with the holding proxy's `force_disconnect_orphan` action. Implemented by
 # unloading the entry, because the BLE coordinator's async_stop (run by async_unload_entry) cancels the link
 # supervisor before releasing, so the release cannot be observed as a drop and
 # reconnected behind us. Cloud entries are skipped: they hold no BLE link.
