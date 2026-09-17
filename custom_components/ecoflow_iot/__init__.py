@@ -253,7 +253,7 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
     released = [
         entry
         for entry in hass.config_entries.async_entries(DOMAIN)
-        if entry.state is ConfigEntryState.LOADED and entry.data.get(CONF_TRANSPORT) == TRANSPORT_BLE
+        if entry.state is ConfigEntryState.LOADED and is_ble_entry(entry)
     ]
     for entry in released:
         with contextlib.suppress(Exception):
