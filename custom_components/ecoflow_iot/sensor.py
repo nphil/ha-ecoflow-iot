@@ -227,11 +227,26 @@ class EcoFlowConnectionSensor(EcoFlowEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return data-source / broker / freshness diagnostics."""
+        """Return data-source / broker / freshness diagnostics.
+
+        `last_mqtt_update` is deliberately truncated to the minute. Home
+        Assistant writes a recorder row whenever ANY attribute changes, so a
+        microsecond-precision timestamp here guaranteed a row for every single
+        MQTT message - a value that can never repeat by construction. Measured
+        on the live install 2026-09-18: 288k rows and 50 MiB for this one
+        entity, 23.8 rows/min, while its state stayed "connected" throughout.
+
+        Whole minutes are all this is for - answering "is data still arriving,
+        roughly when did it last arrive" while looking at the sensor. The
+        unrounded value stays in `state.last_mqtt_ts` and so in diagnostics,
+        and the staleness logic the coordinator acts on uses that, not this.
+        """
         state = self._state
         last_ts = state.last_mqtt_ts if state else None
         last_update = (
-            datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat()
+            datetime.fromtimestamp(last_ts, tz=timezone.utc)
+            .replace(second=0, microsecond=0)
+            .isoformat()
             if last_ts
             else None
         )

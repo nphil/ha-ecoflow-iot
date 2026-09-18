@@ -202,10 +202,18 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             "last_drop": self._last_drop,
             "reconnect_attempt": self._reconnect_attempt,
             "scanner_source": self._scanner_source,
+            # Bucketed to 15 s on purpose. Home Assistant writes a recorder row
+            # whenever any attribute changes, and a frame age recomputed on
+            # every publish can never repeat, so at 0.1 s precision this one
+            # attribute guaranteed a row per frame: 49k rows measured on the
+            # live install 2026-09-18 while the state never moved. Nothing
+            # reads it at sub-bucket resolution (checked: no automation,
+            # script, scene or helper references it), and it exists to answer
+            # "is this link still delivering", for which 15 s is ample.
             "seconds_since_last_frame": (
                 None
                 if last_frame is None
-                else round(time.monotonic() - last_frame, 1)
+                else int((time.monotonic() - last_frame) // 15) * 15
             ),
         }
 
