@@ -421,6 +421,7 @@ class DeviceBase(abc.ABC):
         self,
         user_id: str,
         max_attempts: int | None = None,
+        client_class: type | None = None,
     ):
         Connection.validate_user_id(user_id)
 
@@ -435,6 +436,7 @@ class DeviceBase(abc.ABC):
                     packet_version=self.packet_version,
                     encrypt_type=self.scan_record.encrypt_type,
                     auth_header_dst=self.auth_header_dst,
+                    client_class=client_class,
                 )
                 .with_logging_options(self._logger.options)
                 .with_disabled_reconnect(self._reconnect_disabled)

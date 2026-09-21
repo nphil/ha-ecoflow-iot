@@ -8,9 +8,12 @@ their availability from :attr:`EcoFlowBleCoordinator.connected`.
 
 Deliberate non-behaviours, each of which cost this house time before:
 
-* No scanner is ever pinned. Every attempt hands Home Assistant a freshly
-  resolved ``BLEDevice`` and lets ``habluetooth`` score the proxies, so a device
-  roams because nothing chose for it, not because something forced a hop.
+* Automatic routing remains the default. When the operator names an ESPHome
+  proxy, the affinity wrapper chooses it only while it advertises the device,
+  has a free slot and has fewer than three consecutive failures; otherwise
+  habluetooth's scorer runs unchanged. This is prevention for the failure seen
+  live on 2026-09-20: the River 3 Pro ghosted for four hours on nitins-office,
+  then healed through downstairs in a different room.
 * A healthy link is never torn down and re-established - not for a command, not
   for a refresh, not on a timer. Teardowns are where ghost ACLs come from.
 * A failed attempt never escalates into a config entry reload. The supervisor
@@ -40,6 +43,7 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any
 
+import bleak_retry_connector as brc
 from homeassistant.components import bluetooth
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, callback
@@ -59,11 +63,14 @@ from ..const import (
     BLE_READY_TIMEOUT,
     BLE_SETUP_READY_WAIT,
     CONF_LAST_HOLDING_PROXY,
+    CONF_PREFERRED_PROXY,
+    DEFAULT_PREFERRED_PROXY,
     DEFAULT_UPDATE_PERIOD,
     DOMAIN,
     LINK_DISCONNECTED,
     MANUFACTURER,
 )
+from ..ble_affinity import make_affinity_client_class
 from ..eflib import DeviceBase
 from ..eflib.connection import Connection
 from ..eflib.exceptions import AuthErrors
@@ -143,6 +150,11 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         self._pending_publish: asyncio.TimerHandle | None = None
         self._remove_frame_listener: Callable[[], None] | None = None
         self._scanner_source: str | None = None
+        self._client_class: type | None = None
+        self._preferred_proxy = (
+            entry.options.get(CONF_PREFERRED_PROXY) or DEFAULT_PREFERRED_PROXY
+        )
+        self._via_preferred_proxy = False
         self._last_frame: float | None = None
         # Monotonic for the rolling window, wall clock for what is reported: a
         # monotonic reading is meaningless as a timestamp to anything reading it.
@@ -155,6 +167,11 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
     def connected(self) -> bool:
         """Whether an authenticated link is up right now."""
         return self._connected
+
+    @property
+    def preferred_proxy(self) -> str:
+        """Configured proxy node name, or an empty string for automatic routing."""
+        return self._preferred_proxy
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -202,6 +219,8 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             "last_drop": self._last_drop,
             "reconnect_attempt": self._reconnect_attempt,
             "scanner_source": self._scanner_source,
+            "preferred_proxy": self._preferred_proxy,
+            "via_preferred_proxy": self._via_preferred_proxy,
             # Bucketed to 15 s on purpose. Home Assistant writes a recorder row
             # whenever any attribute changes, and a frame age recomputed on
             # every publish can never repeat, so at 0.1 s precision this one
@@ -365,7 +384,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         try:
             async with asyncio.timeout(BLE_READY_TIMEOUT):
                 await self.device.connect(
-                    user_id=self._user_id, max_attempts=BLE_CONNECT_ATTEMPTS
+                    user_id=self._user_id,
+                    max_attempts=BLE_CONNECT_ATTEMPTS,
+                    client_class=self._affinity_client_class(),
                 )
                 state = await self.device.wait_until_authenticated_or_error(
                     raise_on_error=True
@@ -410,6 +431,26 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             self._pending_publish = None
             self._handle_device_update()
 
+    def _affinity_client_class(self) -> type:
+        """Build once, lazily, the client class that prefers the configured proxy.
+
+        The runtime BleakClient is resolved here rather than at module import:
+        Home Assistant replaces it with its connection-tracking wrapper during
+        Bluetooth startup, and this first runs only for a real connect attempt.
+        """
+        if self._client_class is None:
+            self._client_class = make_affinity_client_class(
+                brc.BleakClient,
+                lambda: self.config_entry.options.get(CONF_PREFERRED_PROXY) or None,
+                on_choice=self._on_preferred_proxy_choice,
+            )
+        return self._client_class
+
+    def _on_preferred_proxy_choice(
+        self, _scanner_name: str, preferred_used: bool
+    ) -> None:
+        """Record whether the most recent connect used the preferred proxy."""
+        self._via_preferred_proxy = preferred_used
     # -- commands ---------------------------------------------------------------
 
     async def async_command(

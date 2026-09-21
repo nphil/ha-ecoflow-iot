@@ -33,9 +33,11 @@ from ..const import (
     CONF_DEVICE_NAME,
     CONF_LOCAL_NAME,
     CONF_MODEL,
+    CONF_PREFERRED_PROXY,
     CONF_SERIAL,
     CONF_UPDATE_PERIOD,
     CONF_USER_ID,
+    DEFAULT_PREFERRED_PROXY,
     DEFAULT_UPDATE_PERIOD,
     DOMAIN,
 )
@@ -185,8 +187,15 @@ async def async_remove_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) 
 async def _async_options_updated(
     hass: HomeAssistant, entry: EcoFlowBleConfigEntry
 ) -> None:
-    """Apply changed options in place; reloading would drop a healthy link."""
-    entry.runtime_data.configure(update_period=_update_period(entry))
+    """Reload for proxy changes; apply the polling interval without a drop."""
+    coordinator = entry.runtime_data
+    preferred_proxy = (
+        entry.options.get(CONF_PREFERRED_PROXY) or DEFAULT_PREFERRED_PROXY
+    )
+    if coordinator.preferred_proxy != preferred_proxy:
+        await hass.config_entries.async_reload(entry.entry_id)
+        return
+    coordinator.configure(update_period=_update_period(entry))
 
 
 def _update_period(entry: EcoFlowBleConfigEntry) -> int:

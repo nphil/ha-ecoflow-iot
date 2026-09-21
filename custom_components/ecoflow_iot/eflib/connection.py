@@ -14,7 +14,7 @@ from functools import cached_property
 from typing import Any, Concatenate, Literal, Self
 
 import ecdsa
-from bleak import BleakClient
+import bleak_retry_connector as brc
 from bleak.backends.characteristic import BleakGATTCharacteristic
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
@@ -255,6 +255,7 @@ class Connection:
         packet_version: int = 0x03,
         encrypt_type: int = 7,
         auth_header_dst: int = 0x35,
+        client_class: type | None = None,
     ) -> None:
         # MODIFICATION vs upstream (ha-ecoflow-iot): explicit contract check, see
         # `validate_user_id`.
@@ -273,12 +274,13 @@ class Connection:
         self._initial_session_key: bytes = b""
         self._frame_assembler: FrameAssembler | None = None
         self._options = Connection.Options()
+        self._client_class = client_class
 
         self._errors = 0
         self._undecryptable_frames = 0
         self._last_errors = deque(maxlen=10)
         self._disconnect_log: deque[dict[str, Any]] = deque(maxlen=10)
-        self._client: BleakClient | None = None
+        self._client: Any | None = None
         self._connected = asyncio.Event()
         self._disconnected = asyncio.Event()
         self._retry_on_disconnect = False
@@ -441,8 +443,13 @@ class Connection:
             # establish_connection needs a real retry count for BLE-level attempts (e.g.
             # when adapter slots are contested).
             ble_attempts = max_attempts if max_attempts != 0 else MAX_CONNECT_ATTEMPTS
+            client_class = (
+                self._client_class
+                if self._client_class is not None
+                else brc.BleakClient
+            )
             self._client = await establish_connection(
-                BleakClient,
+                client_class,
                 self.ble_dev(),
                 self._ble_dev.name or self._address,
                 disconnected_callback=self.disconnected,
@@ -735,7 +742,7 @@ class Connection:
                 await self._state_changed.wait()
 
     async def _auth_failed(
-        self, state: ConnectionState, exc: Exception, client: BleakClient | None
+        self, state: ConnectionState, exc: Exception, client: Any | None
     ) -> None:
         if self._client is not client or not self.is_connected:
             self._logger.warning(

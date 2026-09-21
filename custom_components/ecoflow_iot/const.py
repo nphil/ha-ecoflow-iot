@@ -53,6 +53,11 @@ CONF_LOGIN_REGION: Final = "login_region"
 # Seconds between the periodic data requests the device answers over BLE.
 CONF_UPDATE_PERIOD: Final = "update_period"
 DEFAULT_UPDATE_PERIOD: Final = 10
+# ESPHome node name to prefer when it sees this device. Empty keeps
+# habluetooth's normal RSSI/scorer selection, which remains the safe fallback
+# whenever the named proxy is offline, full or has failed repeatedly.
+CONF_PREFERRED_PROXY: Final = "preferred_proxy"
+DEFAULT_PREFERRED_PROXY: Final = ""
 # Cap on a single BLE connect attempt. Kept short on purpose: habluetooth's
 # connect-failure penalty is sticky, so a long blind attempt through the nearest
 # proxy is worse than failing fast and letting the next attempt be re-scored.

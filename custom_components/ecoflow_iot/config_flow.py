@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
+from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import (
     BluetoothServiceInfoBleak,
     async_discovered_service_info,
@@ -35,6 +36,7 @@ from homeassistant.helpers.selector import (
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
+    SelectSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -58,6 +60,7 @@ from .const import (
     CONF_MQTT_STALE_SECONDS,
     CONF_PASSWORD,
     CONF_POLL_INTERVAL,
+    CONF_PREFERRED_PROXY,
     CONF_REGION,
     CONF_RESET_GRID_ENERGY,
     CONF_SECRET_KEY,
@@ -72,6 +75,7 @@ from .const import (
     DEFAULT_MQTT_REFRESH_INTERVAL,
     DEFAULT_MQTT_STALE_SECONDS,
     DEFAULT_POLL_INTERVAL,
+    DEFAULT_PREFERRED_PROXY,
     DEFAULT_REGION,
     DEFAULT_UPDATE_PERIOD,
     DOMAIN,
@@ -149,6 +153,16 @@ def _local_name(service_info: BluetoothServiceInfoBleak, serial: str) -> str:
     return name
 
 
+def _preferred_proxy_choices(hass: HomeAssistant, current: str) -> list[str]:
+    """List live connectable proxy node names, plus the configured offline one."""
+    names = {
+        scanner.adapter
+        for scanner in bluetooth.async_current_scanners(hass)
+        if scanner.connectable and getattr(scanner, "adapter", None)
+    }
+    if current:
+        names.add(current)
+    return [DEFAULT_PREFERRED_PROXY, *sorted(names)]
 class EcoFlowConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle the EcoFlow IoT config flow."""
 
@@ -489,7 +503,7 @@ class EcoFlowConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 class EcoFlowBleOptionsFlow(OptionsFlow):
-    """The one runtime knob a Bluetooth device has."""
+    """Runtime controls for a Bluetooth device."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -504,7 +518,7 @@ class EcoFlowBleOptionsFlow(OptionsFlow):
     async def async_step_ble_options(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Set how often the device is asked to report."""
+        """Set the report interval and optional preferred proxy."""
         if user_input is not None:
             # Merged, not replaced: options also carry state this form knows
             # nothing about - the proxy that last held the link and the outlet
@@ -515,9 +529,13 @@ class EcoFlowBleOptionsFlow(OptionsFlow):
                 data={
                     **self.config_entry.options,
                     CONF_UPDATE_PERIOD: int(user_input[CONF_UPDATE_PERIOD]),
+                    CONF_PREFERRED_PROXY: user_input[CONF_PREFERRED_PROXY],
                 },
             )
 
+        preferred_proxy = self.config_entry.options.get(
+            CONF_PREFERRED_PROXY, DEFAULT_PREFERRED_PROXY
+        )
         return self.async_show_form(
             step_id="ble_options",
             data_schema=vol.Schema(
@@ -530,6 +548,18 @@ class EcoFlowBleOptionsFlow(OptionsFlow):
                     ): NumberSelector(
                         NumberSelectorConfig(
                             min=1, max=600, step=1, mode=NumberSelectorMode.BOX
+                        )
+                    ),
+                    vol.Required(
+                        CONF_PREFERRED_PROXY, default=preferred_proxy
+                    ): SelectSelector(
+                        SelectSelectorConfig(
+                            options=_preferred_proxy_choices(
+                                self.hass, preferred_proxy
+                            ),
+                            mode=SelectSelectorMode.DROPDOWN,
+                            custom_value=True,
+                            translation_key=CONF_PREFERRED_PROXY,
                         )
                     )
                 }

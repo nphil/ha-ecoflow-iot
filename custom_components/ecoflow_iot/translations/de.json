@@ -120,11 +120,20 @@
       "ble_options": {
         "title": "Optionen für das Bluetooth-Gerät",
         "data": {
-          "update_period": "Aktualisierungsintervall (Sekunden)"
+          "update_period": "Aktualisierungsintervall (Sekunden)",
+          "preferred_proxy": "Preferred proxy"
         },
         "data_description": {
-          "update_period": "Wie oft das Gerät über die gehaltene Bluetooth-Verbindung zur Meldung seiner Werte aufgefordert wird. Kleinere Werte reagieren schneller und belegen etwas mehr Funkzeit; die Verbindung selbst wird ohnehin dauerhaft gehalten."
+          "update_period": "Wie oft das Gerät über die gehaltene Bluetooth-Verbindung zur Meldung seiner Werte aufgefordert wird. Kleinere Werte reagieren schneller und belegen etwas mehr Funkzeit; die Verbindung selbst wird ohnehin dauerhaft gehalten.",
+          "preferred_proxy": "Prefer one named ESPHome Bluetooth proxy by its node name when it can see this device and has a free slot. After three consecutive failures, or whenever it is unavailable, routing falls back to Home Assistant's normal automatic selection."
         }
+      }
+    }
+  },
+  "selector": {
+    "preferred_proxy": {
+      "options": {
+        "": "Automatic (strongest signal)"
       }
     }
   },
