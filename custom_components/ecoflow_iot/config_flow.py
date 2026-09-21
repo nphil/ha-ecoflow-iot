@@ -561,7 +561,7 @@ class EcoFlowBleOptionsFlow(OptionsFlow):
                             custom_value=True,
                             translation_key=CONF_PREFERRED_PROXY,
                         )
-                    )
+                    ),
                 }
             ),
         )
