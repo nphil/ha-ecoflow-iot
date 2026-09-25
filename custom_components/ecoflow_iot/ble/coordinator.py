@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -52,8 +51,8 @@ from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceIn
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from .backoff import attempt_after_drop as _attempt_after_drop, backoff as _backoff
 from ..const import (
-    BLE_BACKOFF_JITTER,
     BLE_BACKOFF_SECONDS,
     BLE_COMMAND_TIMEOUT,
     BLE_CONNECT_ATTEMPTS,
@@ -315,6 +314,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
     async def _supervise(self) -> None:
         """Connect, hold, reconnect - for as long as the entry is loaded."""
         attempt = 0
+        # Consecutive links that dropped before BLE_STABLE_LINK_SECONDS; see
+        # `_attempt_after_drop` for why a short link must not reset the backoff.
+        short_streak = 0
         while True:
             if attempt:
                 self._reconnect_attempt = attempt
@@ -357,15 +359,26 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             self._set_connected(True)
             self._settled.set()
             _LOGGER.info("%s: connected via %s", self.device_name, self.link_state)
+            connected_at = time.monotonic()
 
             # Healthy and idle: nothing to do until the device goes away.
             await self.device.wait_disconnected()
 
+            lived = time.monotonic() - connected_at
             self._record_drop()
             self._set_connected(False)
-            _LOGGER.warning("%s: link dropped; reconnecting", self.device_name)
+            short_streak, attempt = _attempt_after_drop(short_streak, lived)
+            if short_streak:
+                _LOGGER.warning(
+                    "%s: link dropped after only %.0fs (%d in a row); backing off %.0fs",
+                    self.device_name,
+                    lived,
+                    short_streak,
+                    BLE_BACKOFF_SECONDS[min(attempt, len(BLE_BACKOFF_SECONDS)) - 1],
+                )
+            else:
+                _LOGGER.warning("%s: link dropped; reconnecting", self.device_name)
             await self._safe_disconnect()
-            attempt = 1
 
     async def _connect_once(self) -> None:
         """One bounded attempt at an authenticated link."""
@@ -685,9 +698,3 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             if any(held.upper() == address for held in allocations.allocated):
                 return scanner
         return None
-
-
-def _backoff(attempt: int) -> float:
-    """Delay before attempt ``attempt`` (1-based), jittered and capped."""
-    step = BLE_BACKOFF_SECONDS[min(attempt, len(BLE_BACKOFF_SECONDS)) - 1]
-    return step * (1.0 + random.uniform(-BLE_BACKOFF_JITTER, BLE_BACKOFF_JITTER))

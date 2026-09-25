@@ -77,6 +77,13 @@ BLE_BACKOFF_SECONDS: Final = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)
 # Fraction of jitter applied to each backoff step, so several devices that dropped
 # together do not line their retries up on the same proxy.
 BLE_BACKOFF_JITTER: Final = 0.2
+# A link counts as having worked only if it survives this long. One that drops
+# sooner is a failed attempt, not a success: it must NOT reset the backoff.
+# 2026-09-24: a River 3 Pro was dropped ~4.5 s after every authenticated
+# connect, each drop reset the backoff to 1 s, and the resulting ~13 full
+# connect+auth cycles a minute overloaded the proxies carrying it until three
+# of them repeatedly fell off Home Assistant's API.
+BLE_STABLE_LINK_SECONDS: Final = 60.0
 # Window over which link drops are counted for the connection diagnostic.
 BLE_DROP_WINDOW_SECONDS: Final = 3600.0
 # Total budget for one command: the queue wait and the round trip together, so a
