@@ -28,12 +28,16 @@ holder so the vendored notice does not carry demonstrably wrong provenance.
 Scope of the vendored subset
 ----------------------------
 
-Only the import closure of the Wave 3 and River 3 device modules is vendored: 36
-upstream Python files, plus three package `__init__.py` modules authored here (the
-package root, `devices/` and `model/`), so 39 `.py` files in this tree alongside
-`LICENSE` and this notice. Upstream's other ~40 device modules, their protobuf
-definitions and their fixed-length packet models are deliberately absent, as are all
-of upstream's Home Assistant platform modules — this integration has its own.
+Only the import closure of the Wave 3, River 3, and River 2 Pro device modules is
+vendored: 43 upstream Python files, plus three package `__init__.py` modules
+authored here (the package root, `devices/` and `model/`), so 46 `.py` files in this
+tree alongside `LICENSE` and this notice. Upstream's other ~38 device modules, their
+protobuf definitions, their other fixed-length packet models, and River 2 Pro's own
+River 2 / River 2 Max siblings (`devices/river2_max.py`; the plain River 2's R601/
+R603 prefixes stay unregistered even though `devices/river2.py` itself is vendored,
+since `river2_pro.py` subclasses it — see modification 16) are deliberately absent,
+as are all of upstream's Home Assistant platform modules — this integration has its
+own.
 
 Modifications
 -------------
@@ -54,8 +58,12 @@ with a `MODIFICATION vs upstream` comment.
 2. `devices/__init__.py` — rewritten as a plain package marker; the autoimport glob
    is gone (see 1).
 
-3. `model/__init__.py` — rewritten as a plain package marker; upstream re-exports
-   heartbeat-pack dataclasses that are not part of this closure.
+3. `model/__init__.py` — rewritten. Upstream re-exports every heartbeat-pack
+   dataclass in the package (~30 modules, one per fixed-length-coded device); this
+   instead re-exports only `RawData` (`model.base`) and the five heartbeat-pack
+   dataclasses the River 2 (Pro) closure decodes (`DirectPdHeartbeatPack`,
+   `DirectEmsDeltaHeartbeatPack`, `DirectBmsMDeltaHeartbeatPack`,
+   `DirectInvDeltaHeartbeatPack`, `Mr330MpptHeart`).
 
 4. `devicebase.py` — added `DeviceBase.model_name(serial, advertised_name)` as a
    classmethod and made the `device` property delegate to it, so a discovery can be
@@ -149,6 +157,40 @@ with a `MODIFICATION vs upstream` comment.
     per-property callbacks and the `with_update_period` throttle that applies to them
     are unchanged.
 
+16. `devices/river2.py` (new) — vendored for River 2 Pro support. The `device`
+    property became the `model_name` classmethod (see 4), covering all three of
+    upstream's River 2 SKUs (River 2, River 2 Pro, River 2 Max) exactly as upstream's
+    own match statement does, even though only the Pro prefixes are registered (see
+    `eflib/__init__.py`'s `SUPPORTED_DEVICE_CLASSES`) — `river2_pro.Device` inherits
+    this classmethod unchanged, and its own narrower `SN_PREFIX` is what actually
+    limits `check()`. No other change: same raw fixed-length (`RawDataProps`)
+    decoding, same `packet_version = 2` framing, same commands.
+
+17. `devices/river2_pro.py` (new) — vendored unmodified.
+
+18. `model/direct_pd_heartbeat_pack.py` (new) — the field layout is byte-for-byte
+    upstream's `DirectPdHeartbeatPack`; only the import changed, from `from . import
+    RawData` (upstream's package-wide re-export hub, see 3) to `from .base import
+    RawData` directly, since this closure's `model/__init__.py` re-exports a scoped
+    subset rather than everything.
+
+19. `model/direct_bms_heartbeat_pack.py` (new) — same field layout as upstream's
+    `DirectBmsMDeltaHeartbeatPack`; the import changed from `from .pd_heart import
+    RawData` to `from .base import RawData`, since `model/pd_heart.py` (upstream's
+    Delta 2 / Mr330 PD heartbeat definitions) is not part of this closure and is not
+    vendored.
+
+20. `model/mppt_heart.py` (new) — vendored `BaseMpptHeart` and `Mr330MpptHeart`
+    (River 2's MPPT heartbeat) unchanged; dropped upstream's sibling `Mr350MpptHeart`,
+    which River 2 never sends (it belongs to the Delta 2 family).
+
+21. `model/direct_inv_heartbeat_pack.py` (new) — vendored `DirectInvHeartbeatPack`
+    and `DirectInvDeltaHeartbeatPack` (the inverter heartbeat River 2's own
+    `data_parse` decodes) unchanged; dropped upstream's
+    `DirectInvRiverHeartbeatPackBase`, `DirectInvRiverHeartbeatPack`,
+    `DirectInvRiverMiniHeartbeatPack` and `DirectInvDeltaProHeartbeatPack` siblings,
+    which belong to other device families this closure does not vendor.
+
 No frame format, encryption path, packet routing or protobuf definition differs from
 upstream, and no existing command was altered. Modifications 6, 7 and 13 do change
 what this integration can put on the wire: 13 emits three ConfigWrite commands for
@@ -156,6 +198,16 @@ Wave 3 that upstream never sends for this device (`cfg_user_temp_unit`,
 `cfg_lcd_show_temp_type`, `cfg_plug_in_info_ac_in_chg_pow_max`). Every added read
 field and every added command uses a field the vendored `.proto` definitions already
 declare — nothing was reverse engineered or guessed here.
+
+River 2 Pro needed no connection-layer change: `Connection` already threads a
+per-device `packet_version` through the auth handshake (`self._packet_version` in
+`connection.py`, sourced from `DeviceBase.packet_version`), and `Packet.from_bytes`
+already branches on the version byte's low nibble for both V2 and V3 framing. River
+2's `packet_version = 2` override (its frames omit the `dsrc`/`ddst` header bytes V3
+carries) and its un-XORed payloads (it does not override `packet_parse`, unlike
+River 3's `xor_payload=True`) both take the same generic code paths River 3 and
+Wave 3 already exercise, so this closure adds zero lines to `connection.py`,
+`packet.py` or `devicebase.py`.
 
 Wave 3 control coverage
 -----------------------

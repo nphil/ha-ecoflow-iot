@@ -53,7 +53,7 @@ correctly instead of raising an "unsupported device" repair.
 |---|---|---|
 | `R33` | Delta 2 | high (docs + app registry) |
 | `R35` | Delta 2 Max | high (app registry) |
-| `R62` | River 2 Pro | high (app registry; `R60/R61/R63/R65/R70` are other River models) |
+| `R62` | River 2 Pro | high (app registry; `R60/R61/R63/R65/R70` are other River models). Also served over local Bluetooth — see below. |
 | `DCAB` | Delta Pro | high (docs `DCABZ` + field-observed variants, issue #10; app family code is broad `DC`) |
 | `MR5` | Delta Pro 3 | high (app registry) |
 | `Y71` | Delta Pro Ultra | high (app registry) |
@@ -71,9 +71,14 @@ correctly instead of raising an "unsupported device" repair.
 
 ## Supported over local Bluetooth (not served by the open API)
 
-These models answer `quota/all` with error `1006`, so the cloud path skips them; they
-are served over a local BLE link instead. Prefixes are the full 4-character codes the
-vendored codec matches on (`SN_PREFIX` in
+Most of these models answer `quota/all` with error `1006`, so the cloud path skips
+them; they are served over a local BLE link instead. **River 2 Pro (`R621`/`R623`)
+is the exception**: its `quota/all` succeeds, so it already has a working cloud API
+entry (see the table above) — the BLE path here is additional, not a fallback,
+trading a round trip to EcoFlow's servers for faster local push updates and control
+through the house's Bluetooth proxies. A unit reachable both ways ends up as two
+separate config entries, one per transport; nothing here merges them. Prefixes are
+the full 4-character codes the vendored codec matches on (`SN_PREFIX` in
 `custom_components/ecoflow_iot/eflib/devices/`), taken from the advertisement.
 
 | Prefix | Model | Confidence |
@@ -86,6 +91,8 @@ vendored codec matches on (`SN_PREFIX` in
 | `R631` | River 3 Plus | high (upstream device module) |
 | `R634` | River 3 Plus (270) | high (upstream device module) |
 | `R635` | River 3 Plus (Wireless) **or** River 3 Pro | prefix high (upstream device module); **SKU ambiguous** — see below |
+| `R621` | River 2 Pro | high (upstream device module; field-observed) |
+| `R623` | River 2 Pro | high (upstream device module) |
 
 `R635` is shared by more than one SKU, which upstream labels "River 3 Plus Wireless"
 unconditionally. Two units observed in one household differ only in their advertised
@@ -115,7 +122,7 @@ raising an "unsupported device" repair (see `SILENCED_SN_PREFIXES` in
 | `SM2A` | EcoFlow x Shelly Plug (app `sm002`) | Third-party device served only by EcoFlow's private app API (`/iot-smart-voice/thirdDevice/...`, user-login auth). The open API returns no quota. These are genuine Shelly Gen2 devices — use Home Assistant's native **Shelly** integration for local data + control. |
 | `SM3A` | EcoFlow x Shelly Pro3EM meter (app `sm003`) | Same as above. |
 | `DBAB` | Delta Mini | Legacy model not served by the open API: `quota/all` answers error `1006` ("current device is not allowed to get device info"). Not in the developer docs. Field-observed, issue #13. |
-| `R60` | River 2 (256 Wh) | Same as above (`R61` River 2 Max is probably the same, unconfirmed). Field-observed, issue #13. |
+| `R60` | River 2 (256 Wh) | Same as above (`R61` River 2 Max is probably the same, unconfirmed). Field-observed, issue #13. Unlike its `R62` (Pro) sibling, `R60` stays unregistered for BLE too — `river2.Device`'s base class is vendored (see `eflib/NOTICE`) but deliberately left out of `SUPPORTED_DEVICE_CLASSES`, and `R61` (River 2 Max) has no vendored BLE module at all, so both stay unreachable from this integration entirely. |
 
 Any other device whose `quota/all` returns error `1006` is skipped silently as
 well, without needing a prefix entry here. That includes the **Wave 3** and the

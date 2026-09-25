@@ -455,6 +455,12 @@
       "max_ac_charging_power": {
         "name": "Max. AC-Ladeleistung"
       },
+      "solar_input_power": {
+        "name": "Solar-Eingangsleistung"
+      },
+      "car_input_power": {
+        "name": "Fahrzeug-Eingangsleistung"
+      },
       "remaining_time_charging": {
         "name": "Zeit bis voll"
       },
@@ -663,6 +669,14 @@
       },
       "dc_charging_type": {
         "name": "DC-Eingangstyp",
+        "state": {
+          "auto": "Automatisch",
+          "car": "Fahrzeug",
+          "solar": "Solar"
+        }
+      },
+      "dc_mode": {
+        "name": "DC-Modus",
         "state": {
           "auto": "Automatisch",
           "car": "Fahrzeug",

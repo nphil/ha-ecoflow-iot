@@ -157,6 +157,7 @@ CONFIG_CONTROLS: Final[frozenset[str]] = frozenset(
         "ac_charging_speed",
         "dc_charging_max_amps",
         "dc_charging_type",
+        "dc_mode",
         "led_mode",
         "temp_unit",
         "lcd_show_temp_type",

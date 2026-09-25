@@ -9,9 +9,12 @@ Serials and advertised names are synthetic; only the model-selecting prefix is r
 Run: ``python -m pytest tests/test_ble_entities.py``
 """
 
+import dataclasses
+import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -41,8 +44,16 @@ from custom_components.ecoflow_iot.ble import (  # noqa: E402
     switch as ble_switch,
 )
 from custom_components.ecoflow_iot.eflib.devices import (  # noqa: E402
+    river2_pro,
     river3_plus,
     wave3,
+)
+from custom_components.ecoflow_iot.eflib.model import (  # noqa: E402
+    DirectBmsMDeltaHeartbeatPack,
+    DirectEmsDeltaHeartbeatPack,
+    DirectInvDeltaHeartbeatPack,
+    DirectPdHeartbeatPack,
+    Mr330MpptHeart,
 )
 from custom_components.ecoflow_iot.eflib.packet import Packet  # noqa: E402
 from custom_components.ecoflow_iot.eflib.pb import (  # noqa: E402
@@ -52,6 +63,7 @@ from custom_components.ecoflow_iot.eflib.pb import (  # noqa: E402
 
 WAVE_SN = "AC71ZTEST0000001"
 RIVER_SN = "R635ZTEST0000002"
+RIVER2_SN = "R621ZTEST0000003"
 
 
 def _advertisement(local_name: str) -> AdvertisementData:
@@ -188,6 +200,72 @@ async def _river() -> tuple:
         item.statistics_content = value
     await _feed(device, upload, 0x02)
     return device, _Coordinator(device, RIVER_SN)
+
+
+def _pack_raw(cls, **overrides) -> bytes:
+    """Pack a vendored `RawData` dataclass into wire bytes (see test_ble_eflib.py)."""
+    hints = get_type_hints(cls, include_extras=True)
+    values = []
+    for field in dataclasses.fields(cls):
+        if field.name in overrides:
+            values.append(overrides[field.name])
+            continue
+        _, fmt, *_rest = get_args(hints[field.name])
+        values.append(b"" if fmt.endswith("s") else (0.0 if fmt in ("f", "d") else 0))
+    return struct.pack(cls._STRUCT_FMT, *values)
+
+
+async def _river2() -> tuple:
+    device = _make_device(river2_pro, RIVER2_SN, "EF-R20003")
+
+    frames = (
+        (
+            0x02,
+            0x02,
+            _pack_raw(
+                DirectPdHeartbeatPack,
+                watts_out_sum=56,
+                watts_in_sum=0,
+                usb1_watts=5,
+                typec1_watts=10,
+                car_watts=15,
+                watth_is_config=1,
+                backup_soc=30,
+            ),
+        ),
+        (
+            0x03,
+            0x02,
+            _pack_raw(
+                DirectEmsDeltaHeartbeatPack,
+                max_charge_soc=90,
+                min_dsg_soc=10,
+                chg_remain_time=120,
+                dsg_remain_time=300,
+            ),
+        ),
+        (0x03, 0x32, _pack_raw(DirectBmsMDeltaHeartbeatPack, f32_show_soc=76.456, temp=28)),
+        (0x04, 0x02, _pack_raw(DirectInvDeltaHeartbeatPack, input_watts=0, output_watts=45)),
+        (
+            0x05,
+            0x02,
+            _pack_raw(
+                Mr330MpptHeart,
+                cfg_ac_enabled=1,
+                car_state=0,
+                cfg_chg_type=1,  # DCMode.SOLAR
+                in_watts=120,
+                cfg_dc_chg_current=6000,
+                cfg_chg_watts=500,
+            ),
+        ),
+    )
+    for src, cmd_id, payload in frames:
+        await device.data_parse(
+            Packet(src=src, dst=0x21, cmd_set=0x20, cmd_id=cmd_id, payload=payload)
+        )
+
+    return device, _Coordinator(device, RIVER2_SN)
 
 
 @pytest.mark.asyncio
@@ -425,6 +503,52 @@ async def test_outputs_are_offered_and_config_knobs_are_not():
     ):
         assert entity.entity_category == "config", entity.unique_id
         assert entity.entity_registry_enabled_default is False, entity.unique_id
+
+
+@pytest.mark.asyncio
+async def test_river2_pro_key_sensors_and_switches_are_offered():
+    """Same house rules as River 3: outputs enabled, tuning knobs config+disabled."""
+    _, coordinator = await _river2()
+    sensors = await _setup(ble_sensor, coordinator)
+    switches = await _setup(ble_switch, coordinator)
+    numbers = await _setup(ble_number, coordinator)
+    selects = await _setup(ble_select, coordinator)
+
+    for key in (
+        "output_power",
+        "input_power",
+        "ac_input_power",
+        "ac_output_power",
+        "dc12v_output_power",
+        "usba_output_power",
+        "usbc_output_power",
+        "solar_input_power",
+        "car_input_power",
+    ):
+        assert sensors[key].entity_registry_enabled_default is True, key
+        assert sensors[key].entity_category is None, key
+        assert sensors[key].native_value is not None, key
+
+    # Cell temperature is diagnostic and off by default, same house rule as River 3.
+    assert sensors["cell_temperature"].entity_category == "diagnostic"
+    assert sensors["cell_temperature"].entity_registry_enabled_default is False
+
+    for key in ("ac_ports", "dc_12v_port", "energy_backup"):
+        assert switches[key].entity_registry_enabled_default is True, key
+        assert switches[key].entity_category is None, key
+
+    for entity in (
+        numbers["ac_charging_speed"],
+        numbers["dc_charging_max_amps"],
+        numbers["battery_charge_limit_min"],
+        numbers["battery_charge_limit_max"],
+        numbers["energy_backup_battery_level"],
+        selects["dc_mode"],
+    ):
+        assert entity.entity_category == "config", entity.unique_id
+        assert entity.entity_registry_enabled_default is False, entity.unique_id
+
+    assert selects["dc_mode"].current_option == "solar"
 
 
 @pytest.mark.asyncio

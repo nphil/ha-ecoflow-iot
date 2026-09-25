@@ -12,9 +12,12 @@ end to end.
 """
 
 import asyncio
+import dataclasses
+import struct
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import get_args, get_type_hints
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -35,12 +38,21 @@ import logging  # noqa: E402
 
 from custom_components.ecoflow_iot import eflib  # noqa: E402
 from custom_components.ecoflow_iot.eflib.devices import (  # noqa: E402
+    river2,
+    river2_pro,
     river3,
     river3_plus,
     wave3,
 )
 from custom_components.ecoflow_iot.eflib.exceptions import (  # noqa: E402
     NotConnectedError,
+)
+from custom_components.ecoflow_iot.eflib.model import (  # noqa: E402
+    DirectBmsMDeltaHeartbeatPack,
+    DirectEmsDeltaHeartbeatPack,
+    DirectInvDeltaHeartbeatPack,
+    DirectPdHeartbeatPack,
+    Mr330MpptHeart,
 )
 from custom_components.ecoflow_iot.eflib.packet import Packet  # noqa: E402
 from custom_components.ecoflow_iot.eflib.pb import (  # noqa: E402
@@ -119,6 +131,9 @@ def feed(device, cmd_id: int, message) -> None:
             "River 3 Plus (Wireless)",
             river3_plus.Device,
         ),
+        # Real field-observed unit: serial R621FAB1XFAQ0047, advertised name
+        # EF-R20047 (NAME_PREFIX "EF-R2" + last 4 serial chars), heard at -52 dBm.
+        ("R621FAB1XFAQ0047", "EF-R20047", "River 2 Pro", river2_pro.Device),
     ],
 )
 def test_identify_resolves_model_and_class(
@@ -147,7 +162,11 @@ def test_ambiguous_prefix_falls_back_to_family_label(local_name):
         # Delta 2 / Delta 2 Max also advertise EF-R3*; they are cloud-only here.
         ("R331TEST00007777", "EF-R337777"),
         ("R351TEST00007777", "EF-R357777"),
-        ("R621TEST00007777", "EF-R27777"),
+        # Plain River 2 and River 2 Max share river2.py's base class with the
+        # registered River 2 Pro, but neither prefix is in SUPPORTED_DEVICE_CLASSES
+        # (see eflib/NOTICE) - only R621/R623 (Pro) are offered.
+        ("R601TEST00007777", "EF-R27777"),
+        ("R611TEST00007777", "EF-R27777"),
     ],
 )
 def test_unsupported_serial_is_not_offered(serial, local_name):
@@ -424,6 +443,188 @@ def test_extra_ports_stay_unknown_on_units_without_them():
     assert device.usba2_output_power is None
     assert device.dc2_input_power is None
     assert device.dc24v_output_power is None
+
+
+# ------------------------------------------------------------------ river 2 decoding
+
+
+def _pack_raw(cls, **overrides) -> bytes:
+    """
+    Pack a vendored `RawData` dataclass into wire bytes for a `data_parse` test
+
+    No real River 2 Pro capture is available (unlike the River 3 UPS capture above,
+    which came from upstream's own test suite), so this builds a structurally real
+    frame from the vendored struct definitions themselves - the same byte layout and
+    field order upstream authored - with test-chosen values standing in for a live
+    capture. Every field not overridden packs as its type's zero value.
+    """
+    hints = get_type_hints(cls, include_extras=True)
+    values = []
+    for field in dataclasses.fields(cls):
+        if field.name in overrides:
+            values.append(overrides[field.name])
+            continue
+        _, fmt, *_rest = get_args(hints[field.name])
+        values.append(b"" if fmt.endswith("s") else (0.0 if fmt in ("f", "d") else 0))
+    return struct.pack(cls._STRUCT_FMT, *values)
+
+
+# Real field-observed unit (serial R621FAB1XFAQ0047, advertised EF-R20047).
+RIVER2_SN = "R621FAB1XFAQ0047"
+RIVER2_NAME = "EF-R20047"
+
+RIVER2_FRAMES = [
+    Packet(
+        src=0x02,
+        dst=0x21,
+        cmd_set=0x20,
+        cmd_id=0x02,
+        payload=_pack_raw(
+            DirectPdHeartbeatPack,
+            watts_out_sum=56,
+            watts_in_sum=0,
+            usb1_watts=5,
+            typec1_watts=10,
+            car_watts=15,
+            watth_is_config=1,
+            backup_soc=30,
+        ),
+    ),
+    Packet(
+        src=0x03,
+        dst=0x21,
+        cmd_set=0x20,
+        cmd_id=0x02,
+        payload=_pack_raw(
+            DirectEmsDeltaHeartbeatPack,
+            max_charge_soc=90,
+            min_dsg_soc=10,
+            chg_remain_time=120,
+            dsg_remain_time=300,
+        ),
+    ),
+    Packet(
+        src=0x03,
+        dst=0x21,
+        cmd_set=0x20,
+        cmd_id=0x32,
+        payload=_pack_raw(DirectBmsMDeltaHeartbeatPack, f32_show_soc=76.456, temp=28),
+    ),
+    Packet(
+        src=0x04,
+        dst=0x21,
+        cmd_set=0x20,
+        cmd_id=0x02,
+        payload=_pack_raw(DirectInvDeltaHeartbeatPack, input_watts=0, output_watts=45),
+    ),
+    Packet(
+        src=0x05,
+        dst=0x21,
+        cmd_set=0x20,
+        cmd_id=0x02,
+        payload=_pack_raw(
+            Mr330MpptHeart,
+            cfg_ac_enabled=1,
+            car_state=0,
+            cfg_chg_type=1,  # DCMode.SOLAR
+            in_watts=120,
+            cfg_dc_chg_current=6000,
+            cfg_chg_watts=500,
+        ),
+    ),
+]
+
+RIVER2_EXPECTED = {
+    "output_power": 56,
+    "input_power": 0,
+    "usba_output_power": 5,
+    "usbc_output_power": 10,
+    "dc12v_output_power": 15,
+    "energy_backup": True,
+    "energy_backup_battery_level": 30,
+    "battery_charge_limit_max": 90,
+    "battery_charge_limit_min": 10,
+    "remaining_time_charging": 120,
+    "remaining_time_discharging": 300,
+    "battery_level": 76.46,
+    "cell_temperature": 28,
+    "ac_input_power": 0,
+    "ac_output_power": 45,
+    "ac_ports": True,
+    "dc_12v_port": False,
+    "dc_mode": river2.DCMode.SOLAR,
+    "solar_input_power": 120,
+    "car_input_power": 0,
+    "dc_charging_max_amps": 6.0,
+    "ac_charging_speed": 500,
+}
+
+
+@pytest.fixture
+def river2_device():
+    device = make_device(RIVER2_SN, RIVER2_NAME)
+    assert isinstance(device, river2_pro.Device)
+
+    async def _replay():
+        for index, packet in enumerate(RIVER2_FRAMES):
+            assert await device.data_parse(packet) is True, f"frame {index} ignored"
+
+    asyncio.run(_replay())
+    return device
+
+
+@pytest.mark.parametrize(("name", "expected"), sorted(RIVER2_EXPECTED.items()))
+def test_river2_decodes_a_representative_frame(river2_device, name, expected):
+    assert river2_device.get_value(name) == expected
+
+
+def test_river2_dc_mode_gates_solar_and_car_input_power():
+    """Only the active charging source reports the port's power; the other is 0.
+
+    Both fields read the same physical DC port (`dc_port_input_power`); `data_parse`
+    picks one based on the device's own reported `dc_mode`, so this is behaviour, not
+    a field rename - the fixture above already covers the SOLAR branch (mode 1).
+    """
+    device = make_device(RIVER2_SN, RIVER2_NAME)
+
+    async def _feed():
+        await device.data_parse(RIVER2_FRAMES[0])  # PD: seeds unrelated fields
+        await device.data_parse(
+            Packet(
+                src=0x05,
+                dst=0x21,
+                cmd_set=0x20,
+                cmd_id=0x02,
+                payload=_pack_raw(
+                    Mr330MpptHeart,
+                    cfg_chg_type=2,  # DCMode.CAR
+                    in_watts=75,
+                ),
+            )
+        )
+
+    asyncio.run(_feed())
+
+    assert device.dc_mode == river2.DCMode.CAR
+    assert device.car_input_power == 75
+    assert device.solar_input_power == 0
+
+
+def test_river2_base_class_recognises_its_own_prefixes_but_stays_unregistered():
+    """
+    `river2.Device` is vendored only because `river2_pro.Device` subclasses it; its
+    own R601/R603 prefixes are deliberately left out of `SUPPORTED_DEVICE_CLASSES`
+    (see `eflib/NOTICE`). Checks both halves: the class itself still recognises them
+    (nothing broke in transcription) and does not also accept the Pro prefix, and the
+    registry still refuses to resolve a device for them.
+    """
+    assert river2.Device.check(b"R601")
+    assert river2.Device.check(b"R603")
+    assert not river2.Device.check(b"R621")  # Pro's prefix belongs to the subclass
+
+    for serial in ("R601TEST00000000", "R611TEST00000000"):
+        assert eflib.device_class_for_serial(serial) is None
+
 
 
 # ------------------------------------------------------------------ wave 3 decoding

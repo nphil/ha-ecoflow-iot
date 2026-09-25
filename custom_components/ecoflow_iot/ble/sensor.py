@@ -233,6 +233,12 @@ _SENSORS: Final[dict[str, EcoFlowBleSensorEntityDescription]] = {
     "dc12v_output_energy": _energy(),
     "usbc_output_energy": _energy(),
     "usba_output_energy": _energy(),
+    # River 2 (Pro): DC port input power split by charging source. Mutually
+    # exclusive with each other (whichever source is inactive reports 0, not
+    # unknown) - the raw pre-split `dc_port_input_power` feeding both is internal
+    # and not surfaced, to avoid a third sensor describing the same physical input.
+    "solar_input_power": _power(),
+    "car_input_power": _power(),
     # River 3 Plus / Pro add-on battery
     "battery_1_battery_level": _battery(enabled=False),
     "battery_1_cell_temperature": _temperature(

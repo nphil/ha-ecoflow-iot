@@ -21,7 +21,7 @@ from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
 from .devicebase import DeviceBase, ScanRecord
-from .devices import river3, river3_plus, wave3
+from .devices import river2_pro, river3, river3_plus, wave3
 from .entity import controls as controls
 from .entity import units as units
 from .props.updatable_props import UpdatableProps
@@ -33,11 +33,14 @@ if TYPE_CHECKING:
 #:
 #: Order matters: `river3_plus.Device` subclasses `river3.Device`, and both accept a
 #: disjoint set of serial prefixes, but listing the subclass first keeps the resolution
-#: correct if a future prefix is ever accepted by both.
+#: correct if a future prefix is ever accepted by both. `river2_pro.Device` subclasses
+#: `river2.Device`, whose own R601/R603 (plain "River 2") prefixes are deliberately
+#: unregistered - see NOTICE - so its position here is unconstrained.
 SUPPORTED_DEVICE_CLASSES: Final[tuple[type[DeviceBase], ...]] = (
     wave3.Device,
     river3_plus.Device,
     river3.Device,
+    river2_pro.Device,
 )
 
 #: Length of the serial number inside the 0xB5B5 manufacturer payload.
