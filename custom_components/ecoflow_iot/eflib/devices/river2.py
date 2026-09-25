@@ -142,9 +142,24 @@ class Device(DeviceBase, RawDataProps):
 
                 processed = True
 
-        for field_name in self.updated_fields:
-            self.update_callback(field_name)
-            self.update_state(field_name, getattr(self, field_name, None))
+        # MODIFICATION vs upstream (ha-ecoflow-iot): upstream ends here with its own
+        # per-field loop (`update_callback` + `update_state`), copied verbatim below
+        # in comment form for the record:
+        #     for field_name in self.updated_fields:
+        #         self.update_callback(field_name)
+        #         self.update_state(field_name, getattr(self, field_name, None))
+        # That loop predates this fork's property-less notification (see
+        # `DeviceBase.notify_state_changed`, modification 15): it never calls
+        # `notify_state_changed`, which is the ONLY thing `EcoFlowBleCoordinator`
+        # listens for (`self.device.register_callback(self._handle_device_update)`,
+        # registered with no propname). A field landing here was real - the coverage
+        # log showed `updated=1 fields=['battery_level']` on a live River 2 Pro - but
+        # nothing ever told the coordinator to republish, so every entity stayed
+        # "unknown" on an authenticated, undropped link. `_notify_updated()` is a
+        # strict superset of upstream's loop (same per-field calls, plus the missing
+        # notification and the harmless `_recompute()` river3.py/wave3.py already run
+        # unconditionally), so this both fixes and simplifies it.
+        self._notify_updated()
 
         return processed
 

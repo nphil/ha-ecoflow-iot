@@ -191,6 +191,16 @@ with a `MODIFICATION vs upstream` comment.
     `DirectInvRiverMiniHeartbeatPack` and `DirectInvDeltaProHeartbeatPack` siblings,
     which belong to other device families this closure does not vendor.
 
+22. `devices/river2.py` — `data_parse` ended with upstream's own per-field loop
+    (`update_callback` + `update_state`), which does not call
+    `notify_state_changed` (modification 15). `EcoFlowBleCoordinator` listens for
+    exactly that call (`register_callback` with no propname), so a live River 2 Pro
+    authenticated, held its link with no disconnect, and decoded real frames - the
+    packet-coverage log showed `updated=1 fields=['battery_level']` - while every
+    entity stayed "unknown". Replaced the loop with `self._notify_updated()`, which
+    `river3.py`/`wave3.py` already call and which does the same per-field calls plus
+    the missing notification.
+
 No frame format, encryption path, packet routing or protobuf definition differs from
 upstream, and no existing command was altered. Modifications 6, 7 and 13 do change
 what this integration can put on the wire: 13 emits three ConfigWrite commands for

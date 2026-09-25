@@ -22,16 +22,24 @@ from collections.abc import Callable
 from datetime import timedelta
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import (
+    SIGNAL_CONFIG_ENTRY_CHANGED,
+    ConfigEntry,
+    ConfigEntryChange,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import EcoFlowApiError, EcoFlowError, EcoFlowHttpClient, EcoFlowMqttClient
 from .const import (
     API_CODE_DEVICE_NOT_ALLOWED,
+    CONF_SERIAL,
     DEFAULT_MQTT_REFRESH_INTERVAL,
     DEFAULT_MQTT_STALE_SECONDS,
     DEFAULT_POLL_INTERVAL,
@@ -160,8 +168,93 @@ class EcoFlowCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
                 translation_placeholders={"prefix": prefix},
             )
 
+    def _is_ble_owned(self, sn: str) -> bool:
+        """Whether a configured, enabled BLE entry already serves this serial.
+
+        Both transports identify a device the same way - device identifiers
+        {(DOMAIN, sn)} and unique_id f"{sn}_{key}" - so a serial served by both
+        ends up as two Home Assistant devices fighting over the same ids (seen
+        live: "ID R621FAB1XFAQ0047_connection already exists"). BLE wins: it
+        is the more direct link, and a working cloud ``quota/all`` only means
+        the cloud path is optional for that serial, never required.
+        """
+        return any(
+            is_ble_entry(entry)
+            and entry.disabled_by is None
+            and entry.data.get(CONF_SERIAL) == sn
+            for entry in self.hass.config_entries.async_entries(DOMAIN)
+        )
+
+    def _release_ble_owned_entities(self, sn: str) -> int:
+        """Remove this cloud entry's own device/entities for a BLE-owned serial.
+
+        A serial the cloud onboarded before its BLE entry existed leaves
+        registrations behind - and both transports deliberately use the same
+        device identifier ({(DOMAIN, sn)}) and the same unique_id scheme
+        (f"{sn}_{key}") so a device looks identical whichever transport
+        serves it. Those stale entries then block BLE's own entities from
+        ever registering (observed live: "ID R621FAB1XFAQ0047_connection
+        already exists"). A device belongs to exactly one config entry in
+        this Home Assistant version, so removing the one this cloud entry
+        owns frees the identifiers for BLE's setup to claim fresh - nothing
+        to "share". Scoped throughout to entries/devices this cloud entry
+        itself owns, so a sibling account, or a device genuinely still
+        cloud-only, is never touched. Returns how many entities were removed
+        (0 on every setup where there was nothing stale to clean up).
+        """
+        ent_reg = er.async_get(self.hass)
+        prefix = f"{sn}_"
+        stale_entities = [
+            entry.entity_id
+            for entry in er.async_entries_for_config_entry(
+                ent_reg, self.config_entry.entry_id
+            )
+            if entry.unique_id.startswith(prefix)
+        ]
+        for entity_id in stale_entities:
+            ent_reg.async_remove(entity_id)
+
+        dev_reg = dr.async_get(self.hass)
+        for device in dr.async_entries_for_config_entry(
+            dev_reg, self.config_entry.entry_id
+        ):
+            if (DOMAIN, sn) in device.identifiers:
+                dev_reg.async_remove_device(device.id)
+
+        return len(stale_entities)
+
+    def _watch_ble_ownership(self) -> None:
+        """Reload this entry whenever a BLE entry might change who owns a serial."""
+        self.config_entry.async_on_unload(
+            async_dispatcher_connect(
+                self.hass, SIGNAL_CONFIG_ENTRY_CHANGED, self._on_ble_entry_changed
+            )
+        )
+
+    @callback
+    def _on_ble_entry_changed(
+        self, _change: ConfigEntryChange, changed: ConfigEntry
+    ) -> None:
+        """A BLE entry appeared, disappeared, or flipped disabled/enabled.
+
+        Any of those can change which of this account's serials
+        `_is_ble_owned` would now skip, in either direction: removing or
+        disabling a BLE entry hands its serial back to the cloud; adding or
+        re-enabling one takes a serial away. A reload re-runs `async_setup`
+        against the config entries as they now are, which is the simplest way
+        back to a consistent picture. Reacts to every BLE entry, not just one
+        whose serial this account happens to hold - knowing that without an
+        extra device-list call is exactly what the reload finds out - but
+        this is a rare, user-initiated event, not a hot path, so the
+        occasional unnecessary reload costs nothing.
+        """
+        if changed.domain != DOMAIN or not is_ble_entry(changed):
+            return
+        self.hass.config_entries.async_schedule_reload(self.config_entry.entry_id)
+
     async def async_setup(self) -> None:
         """Discover devices, seed data over HTTP and start MQTT."""
+        self._watch_ble_ownership()
         try:
             listed = await self._http.device_list()
         except EcoFlowError as err:
@@ -171,6 +264,25 @@ class EcoFlowCoordinator(DataUpdateCoordinator[dict[str, DeviceState]]):
         for item in listed:
             sn = item.get("sn")
             if not sn:
+                continue
+            if self._is_ble_owned(sn):
+                # No device, no entities, no polling, no MQTT subscription:
+                # not adding it to `self.devices` is what every one of those
+                # is conditioned on (see `_async_start_mqtt`, `_async_update_data`).
+                # `_release_ble_owned_entities` also clears anything this
+                # cloud entry registered for it before its BLE entry existed.
+                removed = self._release_ble_owned_entities(sn)
+                _LOGGER.info(
+                    "%s is configured over local Bluetooth; the cloud path "
+                    "will not poll it or create entities for it%s",
+                    redact_sn(sn),
+                    f" ({removed} stale cloud entit{'y' if removed == 1 else 'ies'} removed)"
+                    if removed
+                    else "",
+                )
+                self.unmapped[sn] = DeviceState(
+                    sn=sn, online=bool(item.get("online", 1))
+                )
                 continue
             state = DeviceState(sn=sn, online=bool(item.get("online", 1)))
             not_served = False

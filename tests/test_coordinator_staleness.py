@@ -16,6 +16,10 @@ def install_ha_stub() -> None:
 
     config_entries = types.ModuleType("homeassistant.config_entries")
     config_entries.ConfigEntry = object
+    config_entries.ConfigEntryChange = types.SimpleNamespace(
+        ADDED="added", REMOVED="removed", UPDATED="updated"
+    )
+    config_entries.SIGNAL_CONFIG_ENTRY_CHANGED = "config_entry_changed"
     sys.modules["homeassistant.config_entries"] = config_entries
 
     core = types.ModuleType("homeassistant.core")
@@ -34,6 +38,20 @@ def install_ha_stub() -> None:
     event = types.ModuleType("homeassistant.helpers.event")
     event.async_track_time_interval = lambda *args, **kwargs: (lambda: None)
     sys.modules["homeassistant.helpers.event"] = event
+
+    dispatcher = types.ModuleType("homeassistant.helpers.dispatcher")
+    dispatcher.async_dispatcher_connect = lambda *args, **kwargs: (lambda: None)
+    sys.modules["homeassistant.helpers.dispatcher"] = dispatcher
+
+    entity_registry = types.ModuleType("homeassistant.helpers.entity_registry")
+    entity_registry.async_get = lambda hass: None
+    entity_registry.async_entries_for_config_entry = lambda registry, entry_id: []
+    sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
+
+    device_registry = types.ModuleType("homeassistant.helpers.device_registry")
+    device_registry.async_get = lambda hass: None
+    device_registry.async_entries_for_config_entry = lambda registry, entry_id: []
+    sys.modules["homeassistant.helpers.device_registry"] = device_registry
 
     issue_registry = types.ModuleType("homeassistant.helpers.issue_registry")
     issue_registry.IssueSeverity = types.SimpleNamespace(WARNING="warning")

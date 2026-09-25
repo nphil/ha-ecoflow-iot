@@ -1165,3 +1165,89 @@ def test_manual_field_notification_reaches_property_less_callbacks():
     assert generic == [1]
     assert per_prop == [1]
     assert values == [False]
+
+
+def test_river2_updates_notify_the_property_less_callback():
+    """
+    Regression: a live River 2 Pro (serial R621FAB1XFAQ0047) authenticated, kept
+    its link up with no disconnect, and the packet-coverage log showed real frames
+    decoding - including `updated=1 fields=['battery_level']` - yet every entity
+    stayed "unknown".
+
+    Root cause: `river2.Device.data_parse` ended with upstream's own per-field loop
+    (`update_callback` + `update_state`), which never calls `notify_state_changed`.
+    That is the ONLY thing `EcoFlowBleCoordinator` listens for
+    (`device.register_callback(self._handle_device_update)`, registered with no
+    propname - see the property-less callback tests above, and modification 15 in
+    eflib/NOTICE, which fixed this exact class of bug for the general mechanism).
+    `river3.py`/`wave3.py` call `self._notify_updated()`, which fires it; `river2.py`
+    did not.
+
+    Frame lengths mirror the live device's own debug log exactly: EMS=46, BMS=69,
+    INV=70, PD=121, MPPT=94 (`payload_len` in "EF-R20047 packet coverage: ...").
+    """
+    device = make_device(RIVER2_SN, RIVER2_NAME)
+
+    frames = (
+        Packet(
+            src=0x03, dst=0x21, cmd_set=0x20, cmd_id=0x02,
+            payload=_pack_raw(DirectEmsDeltaHeartbeatPack),
+        ),
+        Packet(
+            src=0x03, dst=0x21, cmd_set=0x20, cmd_id=0x32,
+            payload=_pack_raw(DirectBmsMDeltaHeartbeatPack),
+        ),
+        Packet(
+            src=0x04, dst=0x21, cmd_set=0x20, cmd_id=0x02,
+            # The live device's own INV frame is 70 bytes; the vendored
+            # DirectInvDeltaHeartbeatPack struct only models 67 - a firmware detail
+            # upstream's struct doesn't declare. struct.unpack ignores the surplus
+            # tail (the fields we read sit well inside the first 67 bytes), so this
+            # is a harmless mismatch, not the bug: padded here to match exactly.
+            payload=_pack_raw(DirectInvDeltaHeartbeatPack) + b"\x00\x00\x00",
+        ),
+        Packet(
+            src=0x02, dst=0x21, cmd_set=0x20, cmd_id=0x02,
+            payload=_pack_raw(DirectPdHeartbeatPack),
+        ),
+        Packet(
+            src=0x05, dst=0x21, cmd_set=0x20, cmd_id=0x02,
+            payload=_pack_raw(Mr330MpptHeart),
+        ),
+    )
+    assert [len(f.payload) for f in frames] == [46, 69, 70, 121, 94]
+
+    async def _replay(packets):
+        for packet in packets:
+            assert await device.data_parse(packet) is True
+
+    # Establishes a baseline, exactly like a device that was already streaming
+    # before this window (the live log's "auth completed" was one of many
+    # reconnects on a link the supervisor holds for the whole config entry).
+    asyncio.run(_replay(frames))
+
+    calls: list[int] = []
+    device.register_callback(lambda: calls.append(1))
+
+    # Identical bytes again: nothing changed, mirroring the live log's five
+    # "updated=0" coverage lines at these exact payload lengths.
+    asyncio.run(_replay(frames))
+    assert calls == [], "a frame that changed nothing must not republish"
+
+    # Mirrors the live log's sixth line: a real change, `updated=1
+    # fields=['battery_level']`.
+    asyncio.run(
+        _replay(
+            [
+                Packet(
+                    src=0x03,
+                    dst=0x21,
+                    cmd_set=0x20,
+                    cmd_id=0x32,
+                    payload=_pack_raw(DirectBmsMDeltaHeartbeatPack, f32_show_soc=41.0),
+                )
+            ]
+        )
+    )
+    assert device.battery_level == 41.0
+    assert calls == [1], "battery_level changed but the coordinator was never told"
