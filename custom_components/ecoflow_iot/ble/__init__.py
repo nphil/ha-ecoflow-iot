@@ -41,7 +41,7 @@ from ..const import (
     DEFAULT_UPDATE_PERIOD,
     DOMAIN,
 )
-from . import unreachable
+from . import link_health, unreachable
 from .coordinator import EcoFlowBleCoordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -177,11 +177,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) 
 async def async_remove_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> None:
     """Drop what a removed entry would otherwise leave behind it.
 
-    The advertisement watch a never-loaded entry may still hold, and its
-    unreachable repair along with any countdown towards one.
+    The advertisement watch a never-loaded entry may still hold, its
+    unreachable repair along with any countdown towards one, and the
+    short-link/backoff history kept in `hass.data` so a reload never lost it -
+    which now outlives the entry it was tracking unless this clears it.
     """
     _cancel_reappear_callback(hass, entry)
     unreachable.async_clear(hass, entry)
+    link_health.clear(hass.data.setdefault(link_health.STORE_KEY, {}), entry.data[CONF_ADDRESS])
 
 
 async def _async_options_updated(

@@ -3,6 +3,7 @@ import struct
 import time
 from dataclasses import dataclass, field
 
+from .connection import ConnectionState
 from .devicebase import DeviceBase
 from .packet import Packet
 from .pb import utc_sys_pb2
@@ -20,6 +21,22 @@ _MIN_RESEND_INTERVAL = 30.0
 class TimeCommands:
     device: DeviceBase
     _last_sent: float | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        # The throttle below is meant to stop a device's own tight re-request
+        # loop within one session; left keyed only on wall-clock time, it also
+        # silences the FIRST request on a brand new link if it happens to fall
+        # within the resend window of the previous link's last send - and
+        # river3.py withholds predictions and config data until this reply
+        # arrives, so a throttled reply leaves a freshly (re)connected device
+        # quietly missing them. 2026-09-24 live: "throttling repeated
+        # time-sync request (last sent 19.2s ago)" fired on the very link that
+        # had just authenticated.
+        self.device.on_connection_state_change(self._on_connection_state_change)
+
+    def _on_connection_state_change(self, state: ConnectionState) -> None:
+        if state.authenticated:
+            self._last_sent = None
 
     async def sendUtcTime(self):
         """Send UTC time as unix timestamp seconds through PB"""

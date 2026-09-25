@@ -10,10 +10,17 @@ Deliberate non-behaviours, each of which cost this house time before:
 
 * Automatic routing remains the default. When the operator names an ESPHome
   proxy, the affinity wrapper chooses it only while it advertises the device,
-  has a free slot and has fewer than three consecutive failures; otherwise
-  habluetooth's scorer runs unchanged. This is prevention for the failure seen
-  live on 2026-09-20: the River 3 Pro ghosted for four hours on nitins-office,
-  then healed through downstairs in a different room.
+  has a free slot, has fewer than three consecutive failures (or has cooled
+  down for one half-open retry since), and has not itself accepted and
+  quickly lost this same link twice in a row recently; otherwise habluetooth's
+  scorer runs, also steered away from a scanner in that last state. See
+  `ble_affinity.py` and `.link_health`. This is prevention for the failure
+  seen live on 2026-09-20: the River 3 Pro ghosted for four hours on
+  nitins-office, then healed through downstairs in a different room - and for
+  the failure seen live on 2026-09-24: a PoE proxy accepted the link and
+  dropped it ~5s later, every time, for hours, because habluetooth clears a
+  scanner's failure count on every successful connect regardless of how long
+  the link then lasted.
 * A healthy link is never torn down and re-established - not for a command, not
   for a refresh, not on a timer. Teardowns are where ghost ACLs come from.
 * A failed attempt never escalates into a config entry reload. The supervisor
@@ -37,9 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import deque
 from collections.abc import Awaitable, Callable
-from datetime import datetime
 from typing import Any
 
 import bleak_retry_connector as brc
@@ -53,13 +58,13 @@ from homeassistant.util import dt as dt_util
 
 from .backoff import attempt_after_drop as _attempt_after_drop, backoff as _backoff
 from ..const import (
+    BLE_AUTH_TIMEOUT,
     BLE_BACKOFF_SECONDS,
     BLE_COMMAND_TIMEOUT,
     BLE_CONNECT_ATTEMPTS,
     BLE_CONNECT_TIMEOUT,
     BLE_DISCONNECT_TIMEOUT,
     BLE_DROP_WINDOW_SECONDS,
-    BLE_READY_TIMEOUT,
     BLE_SETUP_READY_WAIT,
     CONF_LAST_HOLDING_PROXY,
     CONF_PREFERRED_PROXY,
@@ -73,7 +78,7 @@ from ..ble_affinity import make_affinity_client_class
 from ..eflib import DeviceBase
 from ..eflib.connection import Connection
 from ..eflib.exceptions import AuthErrors
-from . import unreachable
+from . import link_health, unreachable
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -154,11 +159,13 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             entry.options.get(CONF_PREFERRED_PROXY) or DEFAULT_PREFERRED_PROXY
         )
         self._via_preferred_proxy = False
+        self._preferred_proxy_suspended = False
         self._last_frame: float | None = None
-        # Monotonic for the rolling window, wall clock for what is reported: a
-        # monotonic reading is meaningless as a timestamp to anything reading it.
-        self._drops: deque[float] = deque()
-        self._last_drop: datetime | None = None
+        # Which scanner authenticated the current link, captured while its
+        # allocation still exists - it is gone by the time a drop is noticed.
+        # Consumed (and cleared) the moment that link's fate - short or
+        # stable - is recorded against it.
+        self._connect_source: str | None = None
 
     # -- state read by entities -------------------------------------------------
 
@@ -211,15 +218,23 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
     def link_attributes(self) -> dict[str, Any]:
         """Diagnostics the household automations read off the link sensor."""
         self._prune_drops()
+        store = self._link_health_store()
+        record = link_health.get(store, self.address)
         last_frame = self._last_frame
         return {
             "hold": self._hold,
-            "drops_1h": len(self._drops),
-            "last_drop": self._last_drop,
+            "drops_1h": len(record.drops),
+            "last_drop": record.last_drop,
             "reconnect_attempt": self._reconnect_attempt,
             "scanner_source": self._scanner_source,
             "preferred_proxy": self._preferred_proxy,
             "via_preferred_proxy": self._via_preferred_proxy,
+            "preferred_proxy_suspended": self._preferred_proxy_suspended,
+            # Sources currently skipped for accepting a connection and then
+            # losing it before BLE_STABLE_LINK_SECONDS - see `link_health`.
+            "avoided_proxies": link_health.penalised_sources(
+                store, self.address, now=time.monotonic()
+            ),
             # Bucketed to 15 s on purpose. Home Assistant writes a recorder row
             # whenever any attribute changes, and a frame age recomputed on
             # every publish can never repeat, so at 0.1 s precision this one
@@ -316,7 +331,12 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         attempt = 0
         # Consecutive links that dropped before BLE_STABLE_LINK_SECONDS; see
         # `_attempt_after_drop` for why a short link must not reset the backoff.
-        short_streak = 0
+        # Kept in hass.data (see `link_health`), not a plain local, so a reload
+        # - manual, options-triggered, or the household autoheal's five-minute
+        # sweep for a device that is still down - resumes the same streak
+        # instead of restarting the ladder at its 2s floor.
+        store = self._link_health_store()
+        short_streak = link_health.get(store, self.address).streak
         while True:
             if attempt:
                 self._reconnect_attempt = attempt
@@ -368,6 +388,15 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             self._record_drop()
             self._set_connected(False)
             short_streak, attempt = _attempt_after_drop(short_streak, lived)
+            link_health.get(store, self.address).streak = short_streak
+            source, self._connect_source = self._connect_source, None
+            if source:
+                if short_streak:
+                    link_health.record_short_link(
+                        store, self.address, source, now=time.monotonic()
+                    )
+                else:
+                    link_health.record_stable_link(store, self.address, source)
             if short_streak:
                 _LOGGER.warning(
                     "%s: link dropped after only %.0fs (%d in a row); backing off %.0fs",
@@ -395,12 +424,26 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             self._scanner_source = service_info.source
 
         try:
-            async with asyncio.timeout(BLE_READY_TIMEOUT):
+            # The connect step and the auth handshake get separate budgets: a
+            # slow connect used to be able to eat almost all of a single 45s
+            # window shared between the two, leaving the handshake seconds
+            # where it needs up to BLE_AUTH_TIMEOUT. `Connection.connect`
+            # itself now bounds the connect step (`establish_connection`) to
+            # BLE_CONNECT_TIMEOUT * BLE_CONNECT_ATTEMPTS; this outer timeout
+            # is deliberately one BLE_CONNECT_TIMEOUT wider than that, not
+            # equal to it - equal would let this one fire first over nothing
+            # but the surrounding overhead (BLE device lookup, affinity
+            # selection, `close_stale_connections_by_address`, characteristic
+            # validation), cancelling a connect that was not actually stuck.
+            async with asyncio.timeout(
+                BLE_CONNECT_TIMEOUT * (BLE_CONNECT_ATTEMPTS + 1)
+            ):
                 await self.device.connect(
                     user_id=self._user_id,
                     max_attempts=BLE_CONNECT_ATTEMPTS,
                     client_class=self._affinity_client_class(),
                 )
+            async with asyncio.timeout(BLE_AUTH_TIMEOUT):
                 state = await self.device.wait_until_authenticated_or_error(
                     raise_on_error=True
                 )
@@ -456,6 +499,8 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
                 brc.BleakClient,
                 lambda: self.config_entry.options.get(CONF_PREFERRED_PROXY) or None,
                 on_choice=self._on_preferred_proxy_choice,
+                is_penalised=self._is_scanner_penalised,
+                on_suspension_change=self._on_preferred_proxy_suspension_change,
             )
         return self._client_class
 
@@ -464,6 +509,30 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
     ) -> None:
         """Record whether the most recent connect used the preferred proxy."""
         self._via_preferred_proxy = preferred_used
+
+    def _on_preferred_proxy_suspension_change(
+        self, _scanner_name: str, suspended: bool
+    ) -> None:
+        """Record whether the preferred proxy is currently being skipped."""
+        self._preferred_proxy_suspended = suspended
+
+    def _is_scanner_penalised(self, scanner: Any) -> bool:
+        """Whether `scanner` has recently accepted this link and then lost it.
+
+        Backs `ble_affinity`'s `is_penalised` hook; kept here rather than in
+        that Home-Assistant-free module because it is the only piece that
+        needs `hass.data`.
+        """
+        source = getattr(scanner, "source", None)
+        if not source:
+            return False
+        return link_health.is_penalised(
+            self._link_health_store(), self.address, source, now=time.monotonic()
+        )
+
+    def _link_health_store(self) -> dict[str, link_health.AddressLinkHealth]:
+        return self.hass.data.setdefault(link_health.STORE_KEY, {})
+
     # -- commands ---------------------------------------------------------------
 
     async def async_command(
@@ -477,6 +546,7 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         when the device pushes the new value.
         """
         executing = False
+        conn: Connection | None = None
         if not self._connected:
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
@@ -499,6 +569,12 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
                             },
                         )
                     executing = True
+                    # Captured for `_async_drop_wedged_link`: if this command's
+                    # failure only surfaces after the supervisor has already
+                    # replaced the link (a retried send can take several
+                    # seconds), that failure must not be allowed to drop the
+                    # connection this command never touched.
+                    conn = self.device.current_connection
                     await func()
         except HomeAssistantError:
             # The caller already framed this for the user (e.g. the device
@@ -509,7 +585,7 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             if executing:
                 # The device stopped answering mid-command: the link is wedged,
                 # not merely busy, and only a fresh one will recover it.
-                await self._async_drop_wedged_link(name)
+                await self._async_drop_wedged_link(name, conn)
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
                 translation_key="command_timeout",
@@ -518,20 +594,36 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         except Exception as err:
             # A transport error leaves the link in an unknown state; hand it back
             # to the supervisor rather than keeping a connection we cannot use.
-            await self._async_drop_wedged_link(name)
+            await self._async_drop_wedged_link(name, conn)
             raise HomeAssistantError(
                 translation_domain=DOMAIN,
                 translation_key="command_failed",
                 translation_placeholders={"name": name, "error": str(err)},
             ) from err
 
-    async def _async_drop_wedged_link(self, name: str) -> None:
+    async def _async_drop_wedged_link(
+        self, name: str, conn: Connection | None
+    ) -> None:
         """Release a link a command could not use, so the supervisor rebuilds it.
 
         Entities go unavailable immediately rather than showing values from a
         connection that is no longer answering, and the supervisor's own wait
         ends as the device disconnects, taking it through its normal backoff.
+
+        ``conn`` is the `Connection` the failing command actually ran on,
+        captured before it ran. A retried send can take several seconds - long
+        enough for the supervisor to have already replaced the link by the
+        time the failure surfaces here - and dropping "whatever is current" in
+        that case would take down a connection this command never touched.
         """
+        if conn is None or self.device.current_connection is not conn:
+            _LOGGER.debug(
+                "%s: %s failed on a link the supervisor already replaced; "
+                "nothing to drop",
+                self.device_name,
+                name,
+            )
+            return
         _LOGGER.warning(
             "%s: %s left the link unusable; releasing it to reconnect",
             self.device_name,
@@ -640,18 +732,27 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         self.last_update_success = connected
         if connected:
             self._remember_holding_proxy()
+            # The allocation this reads is gone by the time a drop is noticed,
+            # so it has to be captured here, at the only moment it exists.
+            self._connect_source = self._holding_scanner_source()
         self.reconcile_unreachable_issue()
         self.async_update_listeners()
 
     def _record_drop(self) -> None:
-        self._drops.append(time.monotonic())
-        self._last_drop = dt_util.utcnow()
+        link_health.record_drop(
+            self._link_health_store(),
+            self.address,
+            when=time.monotonic(),
+            wall_clock=dt_util.utcnow(),
+        )
         self._prune_drops()
 
     def _prune_drops(self) -> None:
-        cutoff = time.monotonic() - BLE_DROP_WINDOW_SECONDS
-        while self._drops and self._drops[0] < cutoff:
-            self._drops.popleft()
+        link_health.prune_drops(
+            self._link_health_store(),
+            self.address,
+            cutoff=time.monotonic() - BLE_DROP_WINDOW_SECONDS,
+        )
 
     def _holding_scanner(self) -> str | None:
         """Name the adapter or proxy currently holding this device's link.
@@ -678,6 +779,17 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         """
         scanner = self._scanner_holding_link()
         return None if scanner is None else (scanner.adapter or None)
+
+    def _holding_scanner_source(self) -> str | None:
+        """Stable identifier of the scanner currently holding the link.
+
+        Unlike `_holding_node` (an ESPHome node name, renamed by the user) or
+        `_holding_scanner` (a display name), this is what `ble_affinity`'s
+        short-link bookkeeping keys on - it does not change if the proxy is
+        renamed in Home Assistant.
+        """
+        scanner = self._scanner_holding_link()
+        return None if scanner is None else scanner.source
 
     def _scanner_holding_link(self) -> Any | None:
         """The scanner whose connection slots hold this device, if any does.

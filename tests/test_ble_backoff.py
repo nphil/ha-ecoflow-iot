@@ -25,6 +25,7 @@ if "custom_components.ecoflow_iot.ble" not in sys.modules:
     sys.modules["custom_components.ecoflow_iot.ble"] = ble
 
 from custom_components.ecoflow_iot.ble.backoff import attempt_after_drop  # noqa: E402
+from custom_components.ecoflow_iot.ble import link_health  # noqa: E402
 from custom_components.ecoflow_iot.const import (  # noqa: E402
     BLE_BACKOFF_SECONDS,
     BLE_STABLE_LINK_SECONDS,
@@ -53,3 +54,34 @@ def test_a_stable_link_drop_reconnects_promptly_and_clears_the_streak() -> None:
     # The next short drop starts climbing from the bottom again.
     streak, attempt = attempt_after_drop(streak, lived=3.0)
     assert (streak, attempt) == (1, 2)
+
+
+def test_streak_survives_a_reload_so_backoff_does_not_collapse() -> None:
+    """The reconnect streak must live in `hass.data`, not a local variable.
+
+    Every reload of the config entry - manual, options-triggered, or the
+    household autoheal's five-minute sweep for a device that is still down -
+    used to start a fresh supervisor with `short_streak = 0` (a local variable
+    in `_supervise`), so the very first drop after a reload always retried at
+    the 1s floor even when the same address had just racked up a long streak
+    of them moments before.
+    """
+    store: dict = {}
+    address = "AA:BB:CC:DD:EE:FF"
+
+    # First "supervisor": four short drops in a row.
+    streak = link_health.get(store, address).streak
+    for _ in range(4):
+        streak, _ = attempt_after_drop(streak, lived=4.5)
+        link_health.get(store, address).streak = streak
+
+    # A reload discards the coordinator instance - and with it any local
+    # `short_streak` variable - leaving only the store behind. A fresh
+    # supervisor for the same address must resume from what it holds.
+    resumed_streak = link_health.get(store, address).streak
+    resumed_streak, attempt = attempt_after_drop(resumed_streak, lived=4.5)
+
+    assert _step(attempt) != BLE_BACKOFF_SECONDS[0], (
+        "a reload must not reset a long short-link streak back to the 1s floor"
+    )
+    assert _step(attempt) == BLE_BACKOFF_SECONDS[-1]

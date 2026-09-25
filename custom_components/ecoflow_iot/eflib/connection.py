@@ -281,6 +281,12 @@ class Connection:
         self._last_errors = deque(maxlen=10)
         self._disconnect_log: deque[dict[str, Any]] = deque(maxlen=10)
         self._client: Any | None = None
+        # Set by `disconnect()` when it catches a connect still inside
+        # `establish_connection()`; `connect()` checks it the moment that call
+        # returns, before committing to the client it produced. See finding 4
+        # in the 2026-09-24 audit: without this, a stale command's teardown
+        # racing the supervisor's next connect orphaned the newer link.
+        self._abort_pending_connect = False
         self._connected = asyncio.Event()
         self._disconnected = asyncio.Event()
         self._retry_on_disconnect = False
@@ -426,6 +432,9 @@ class Connection:
 
         self._connected.clear()
         self._disconnected.clear()
+        # A disconnect() arriving while this attempt is establishing sets this;
+        # it must not carry over from whatever the previous attempt left it as.
+        self._abort_pending_connect = False
 
         error = None
         try:
@@ -448,15 +457,42 @@ class Connection:
                 if self._client_class is not None
                 else brc.BleakClient
             )
-            self._client = await establish_connection(
-                client_class,
-                self.ble_dev(),
-                self._ble_dev.name or self._address,
-                disconnected_callback=self.disconnected,
-                ble_device_callback=self.ble_dev,
-                max_attempts=ble_attempts,
-                timeout=self._options.timeout,
-            )
+            # MODIFICATION vs upstream (ha-ecoflow-iot): `timeout=` below reaches
+            # establish_connection only as a *client-constructor* kwarg -
+            # bleak_retry_connector's own retry loop calls the real
+            # `client.connect()` with its own hardcoded 20s timeout regardless, so
+            # BLE_CONNECT_TIMEOUT never actually bounded a connect attempt. This
+            # `asyncio.timeout` is what does that now: the whole call - every
+            # internal attempt bleak_retry_connector makes - is capped at
+            # `Options.timeout * ble_attempts` instead of being able to run for
+            # bleak_retry_connector's own safety timeout (60s) per attempt.
+            async with asyncio.timeout(self._options.timeout * ble_attempts):
+                self._client = await establish_connection(
+                    client_class,
+                    self.ble_dev(),
+                    self._ble_dev.name or self._address,
+                    disconnected_callback=self.disconnected,
+                    ble_device_callback=self.ble_dev,
+                    max_attempts=ble_attempts,
+                    timeout=self._options.timeout,
+                )
+            if self._abort_pending_connect:
+                # A disconnect() arrived while establish_connection() was still
+                # running - too late to cancel from there (that coroutine is not
+                # ours to cancel; it belongs to whoever is awaiting `connect()`),
+                # so the client it just produced is unwanted. Tear it down now
+                # rather than let it authenticate a link nothing owns any more:
+                # that is how a stale command's teardown orphaned the
+                # supervisor's newer connection.
+                self._logger.info(
+                    "Connect aborted while establishing (a disconnect arrived "
+                    "mid-attempt); dropping the link nothing owns any more"
+                )
+                await self._disconnect_client()
+                self._client = None
+                self._abort_pending_connect = False
+                self._set_state(ConnectionState.DISCONNECTED, reason="aborted mid-connect")
+                return
             self._validate_characteristics()
         except UnsupportedBluetoothProtocol as e:
             error = e
@@ -608,6 +644,16 @@ class Connection:
         self._reconnect_attempt = 0
         await self._stop_data_pump()
         self._cancel_tasks()
+
+        if self._state is ConnectionState.ESTABLISHING_CONNECTION:
+            # `establish_connection()` is running inside whoever is awaiting
+            # `connect()` (the supervisor, on its own task) - it is not safe to
+            # cancel from here, since cancelling would abort that caller's whole
+            # await, not just this step. Flag it instead: `connect()` checks this
+            # the moment establish_connection() returns and disconnects the
+            # client it produced rather than letting it authenticate a link
+            # nothing owns any more.
+            self._abort_pending_connect = True
 
         if self._client is not None and self._client.is_connected:
             self._set_state(ConnectionState.DISCONNECTING, reason=reason)

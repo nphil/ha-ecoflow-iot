@@ -180,6 +180,17 @@ class DeviceBase(abc.ABC):
     def is_connected(self) -> bool:
         return self._conn is not None and self._conn.is_connected
 
+    @property
+    def current_connection(self) -> Connection | None:
+        """The `Connection` object backing the link right now, or ``None``.
+
+        Identity only, not a general accessor - it exists so a caller that
+        started work against "whatever is current" (a command) can later tell
+        whether the supervisor has since replaced it, without reaching into a
+        private attribute. Not a stronger claim than `is_connected` makes.
+        """
+        return self._conn
+
     def update_ble_device(self, ble_dev: BLEDevice):
         self._ble_dev = ble_dev
         if self._conn is not None:
@@ -465,13 +476,25 @@ class DeviceBase(abc.ABC):
         self.connection_log.append(state, reason)
 
     async def disconnect(self):
-        if self._conn is None:
-            self._logger.error("Device has no connection")
+        conn = self._conn
+        if conn is None:
+            # Expected, not exceptional: async_stop() disconnects unconditionally
+            # after a cancelled connect has already torn itself down, and a
+            # command's teardown can race a drop the supervisor is already
+            # handling. ERROR here used to show up in the very logs used to
+            # triage real drops.
+            self._logger.debug("Device has no connection")
             return
 
-        await self._conn.disconnect(reason=caller_chain())
-        self._connection_event.clear()
-        self._conn = None
+        await conn.disconnect(reason=caller_chain())
+        # Only clear the reference if nothing replaced it while we were
+        # awaiting - `conn` may be an old connection whose teardown is only
+        # finishing now, well after the supervisor moved on to a newer one.
+        # Clearing unconditionally here is how that newer connection's
+        # reference got wiped out from under it.
+        if self._conn is conn:
+            self._connection_event.clear()
+            self._conn = None
 
     async def wait_connected(self, timeout: int = 20):
         if self._conn is None:

@@ -65,8 +65,14 @@ BLE_CONNECT_TIMEOUT: Final = 10.0
 # BLE attempts inside one supervisor pass. Home Assistant re-picks the proxy for
 # each of them, so a second attempt is a genuine second path, not a repeat.
 BLE_CONNECT_ATTEMPTS: Final = 2
-# Outer bound on one supervisor pass: link established *and* authenticated.
-BLE_READY_TIMEOUT: Final = 45.0
+# Handshake budget, measured from 'Connected' rather than shared with the
+# connect step: sharing one 45s window between an unbounded connect and the
+# three-stage auth handshake let a slow connect (bleak_retry_connector's own
+# per-attempt timeout is 20s, unrelated to BLE_CONNECT_TIMEOUT - see
+# `eflib.connection.Connection.connect`) starve the handshake of the time it
+# needs. Each of the three stages is itself bounded by BLE_CONNECT_TIMEOUT
+# (`Connection.Options.timeout`), so 3x covers the whole sequence once.
+BLE_AUTH_TIMEOUT: Final = 3 * BLE_CONNECT_TIMEOUT
 # How long entry setup waits for the first authenticated link before returning.
 # It never fails the entry - the supervisor keeps trying - it only decides how
 # long Home Assistant's startup is held for entities that would come up populated.
