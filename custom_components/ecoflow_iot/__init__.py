@@ -8,11 +8,13 @@ from pathlib import Path
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
+from homeassistant.core import CoreState, HassJob, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.importlib import async_import_module
+from homeassistant.helpers.typing import ConfigType
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.loader import async_get_integration
 
@@ -35,14 +37,18 @@ from .const import (
     DEFAULT_POLL_INTERVAL,
     DEFAULT_REGION,
     DOMAIN,
+    SHUTDOWN_LATCH_KEY,
     is_ble_entry,
 )
 from .coordinator import EcoFlowCoordinator
 import contextlib
 import voluptuous as vol
+from collections.abc import Callable
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _STATIC_PATH_KEY = f"{DOMAIN}_card_static_registered"
 
@@ -271,10 +277,15 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             await hass.config_entries.async_unload(entry.entry_id)
         _LOGGER.info("Released the Bluetooth link held for %s", entry.title)
 
-    if not released or resume_after <= 0:
+    if not released or resume_after <= 0 or hass.data.get(SHUTDOWN_LATCH_KEY):
         return
 
+    resumes: dict[Callable[[], None], None] = hass.data.setdefault(_RESUMES_KEY, {})
+
     async def _resume(_now: Any) -> None:
+        resumes.pop(cancel, None)
+        if hass.data.get(SHUTDOWN_LATCH_KEY):
+            return  # Home Assistant is going down; a link now would never be released
         for entry in released:
             if entry.state is ConfigEntryState.LOADED:
                 continue  # something set it up already; it owns itself now
@@ -285,7 +296,42 @@ async def _async_release_links(hass: HomeAssistant, resume_after: int) -> None:
             resume_after,
         )
 
-    async_call_later(hass, resume_after, _resume)
+    cancel = async_call_later(hass, resume_after, _resume)
+    resumes[cancel] = None
+
+
+# ---------------------------------------------------------------------------
+# Domain-lifetime shutdown latch
+# ---------------------------------------------------------------------------
+#
+# Home Assistant enumerates its shutdown jobs ONCE, at the start of stage 1, and
+# `hass.state` is still `running` throughout it. A BLE entry's own job is removed
+# when the entry unloads, which is exactly what `release_link` does - so a
+# `release_link(resume_after=N)` followed by a shutdown would leave no job and no
+# latch, and the resume timer could set both batteries up again mid-stage with
+# nothing left to release them. This job belongs to the integration, not to an
+# entry: registered once in `async_setup`, never removed. It is a plain callback
+# so it runs synchronously, ahead of every entry job's coroutine, and it does
+# only two things: set the flag every BLE setup/resume/reappear path checks, and
+# cancel the pending resume timers.
+_RESUMES_KEY = f"{DOMAIN}_release_resumes"
+
+
+@callback
+def _async_latch_at_shutdown(hass: HomeAssistant) -> None:
+    """Refuse every new BLE link for the rest of this process; never raises."""
+    hass.data[SHUTDOWN_LATCH_KEY] = True
+    for cancel in list(hass.data.pop(_RESUMES_KEY, {})):
+        with contextlib.suppress(Exception):
+            cancel()
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the domain-lifetime shutdown latch (once per Home Assistant run)."""
+    hass.async_add_shutdown_job(
+        HassJob(_async_latch_at_shutdown, f"{DOMAIN} latch BLE shutdown"), hass
+    )
+    return True
 
 
 @callback

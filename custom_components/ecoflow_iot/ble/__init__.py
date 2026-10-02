@@ -32,6 +32,7 @@ from homeassistant.exceptions import (
 
 from ..const import (
     BLE_SHUTDOWN_TIMEOUT,
+    SHUTDOWN_LATCH_KEY,
     CONF_ADDRESS,
     CONF_DEVICE_NAME,
     CONF_LOCAL_NAME,
@@ -62,21 +63,18 @@ PLATFORMS: list[Platform] = [
 ]
 
 _REAPPEAR_KEY = f"{DOMAIN}_ble_reappear"
-# Set (in `hass.data`, so for the life of the process) by the first shutdown job
-# to run. Entries that held no link when it ran - one still waiting for its
-# device to advertise - would otherwise be set up by a late advertisement and
-# open a link nobody will release.
-_SHUTDOWN_KEY = f"{DOMAIN}_ble_shutdown"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> bool:
     """Set up one EcoFlow device over Bluetooth."""
+    if hass.data.get(SHUTDOWN_LATCH_KEY):
+        raise _shutting_down()
     # Imported through the executor: a cloud-only installation never pays for
     # protobuf and the crypto stack, and the crypto import's ctypes/libgmp
     # probing never lands on the event loop.
     eflib = await async_import_module(hass, f"{__package__.rpartition('.')[0]}.eflib")
-    if hass.data.get(_SHUTDOWN_KEY):
-        raise ConfigEntryNotReady("Home Assistant is shutting down")
+    if hass.data.get(SHUTDOWN_LATCH_KEY):
+        raise _shutting_down()
 
     address: str = entry.data[CONF_ADDRESS]
     serial: str = entry.data[CONF_SERIAL]
@@ -172,6 +170,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
         )
 
     entry.runtime_data = coordinator
+    if hass.data.get(SHUTDOWN_LATCH_KEY):
+        # Shutdown began while the link was being established; the entry's own
+        # job may already have run (or may be about to), so just make sure
+        # nothing is left holding the link and refuse.
+        await coordinator.async_stop()
+        raise _shutting_down()
     try:
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except Exception:
@@ -179,8 +183,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
         # leave it, and its background task, running unowned.
         await coordinator.async_stop()
         raise
+    if hass.data.get(SHUTDOWN_LATCH_KEY):
+        await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+        await coordinator.async_stop()
+        raise _shutting_down()
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
+
+
+def _shutting_down() -> ConfigEntryNotReady:
+    """Why a setup is refused once the shutdown jobs have started.
+
+    Home Assistant enumerates its shutdown jobs once, at the start of the
+    stage, so a link opened after that is never released. Not a fault: the
+    entry is simply not set up in a process that is going away.
+    """
+    return ConfigEntryNotReady("Home Assistant is shutting down")
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> bool:
@@ -219,7 +237,7 @@ async def _async_release_at_shutdown(
     keep. Bounded, and it never raises: a failure here must not hold up the
     shutdown (a NameError in this path once aborted a whole restart).
     """
-    hass.data[_SHUTDOWN_KEY] = True
+    hass.data[SHUTDOWN_LATCH_KEY] = True
     started = time.monotonic()
     try:
         coordinator.close_for_shutdown()
@@ -291,7 +309,7 @@ def _register_reappear_callback(
         service_info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
         _cancel_reappear_callback(hass, entry)
-        if hass.data.get(_SHUTDOWN_KEY):
+        if hass.data.get(SHUTDOWN_LATCH_KEY):
             return  # shutting down: a new link now would never be released
         # The entry may have been removed or reloaded while we were waiting; only
         # a still-retrying entry has anything to gain from being retried now.

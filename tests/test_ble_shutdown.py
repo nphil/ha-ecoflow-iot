@@ -45,6 +45,7 @@ from custom_components.ecoflow_iot.const import (  # noqa: E402
     CONF_SERIAL,
     CONF_USER_ID,
     DOMAIN,
+    SHUTDOWN_LATCH_KEY,
 )
 from custom_components.ecoflow_iot.eflib.exceptions import LinkClosed  # noqa: E402
 
@@ -168,6 +169,7 @@ def _make_hass(stack) -> HomeAssistant:
     # Before bootstrap `hass.config_entries` is None; give it the calls used here.
     hass.config_entries = SimpleNamespace(
         async_forward_entry_setups=AsyncMock(),
+        async_unload_platforms=AsyncMock(return_value=True),
         async_unload=AsyncMock(),
         async_schedule_reload=Mock(),
         async_get_entry=Mock(),
@@ -272,7 +274,7 @@ def test_job_releases_the_link_and_latches_without_unloading(stack) -> None:
         assert device.connects == 1
         with pytest.raises(HomeAssistantError):
             await coordinator.async_command(AsyncMock(), name="turn on")
-        assert hass.data[ble._SHUTDOWN_KEY] is True
+        assert hass.data[SHUTDOWN_LATCH_KEY] is True
 
     asyncio.run(scenario())
 
@@ -436,5 +438,159 @@ def test_release_link_action_still_unloads_ble_entries_only(monkeypatch) -> None
         monkeypatch.setattr(integration, "is_ble_entry", lambda e: e is ble_entry)
         await integration._async_release_links(hass, 0)
         assert unloaded == ["ble"]
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------- addendum ---
+
+
+def _run_shutdown_jobs_like_home_assistant(hass: HomeAssistant) -> list:
+    """Stage 1 of `HomeAssistant.async_stop`: the list is enumerated once, here."""
+    tasks = []
+    for job in list(hass._shutdown_jobs):
+        task_or_none = hass.async_run_hass_job(job.job, *job.args)
+        if task_or_none:
+            tasks.append(task_or_none)
+    return tasks
+
+
+def _loaded_ble_entry(entry_id: str):
+    return SimpleNamespace(
+        entry_id=entry_id,
+        title="River 3 Pro",
+        state=ConfigEntryState.LOADED,
+        data={},
+        unique_id=entry_id,
+    )
+
+
+def _release_link_hass(stack, entries):
+    hass = _make_hass(stack)
+    setups: list[str] = []
+
+    async def async_unload(entry_id: str) -> bool:
+        for entry in entries:
+            if entry.entry_id == entry_id:
+                entry.state = ConfigEntryState.NOT_LOADED
+        return True
+
+    async def async_setup(entry_id: str) -> bool:
+        setups.append(entry_id)
+        return True
+
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda _domain: entries,
+        async_unload=async_unload,
+        async_setup=async_setup,
+    )
+    return hass, setups
+
+
+def test_release_link_resume_fires_when_nothing_shuts_down(monkeypatch, stack) -> None:
+    """Control for the next test: the resume timer does bring the entries back."""
+
+    async def scenario() -> None:
+        entries = [_loaded_ble_entry("a"), _loaded_ble_entry("b")]
+        monkeypatch.setattr(integration, "is_ble_entry", lambda _e: True)
+        hass, setups = _release_link_hass(stack, entries)
+        await integration.async_setup(hass, {})
+        await integration._async_release_links(hass, 0.1)
+        await asyncio.sleep(0.4)
+        assert setups == ["a", "b"]
+
+    asyncio.run(scenario())
+
+
+def test_latch_job_outlives_release_link_and_cancels_pending_resumes(
+    monkeypatch, stack
+) -> None:
+    """`release_link(resume_after=N)` then a shutdown must not reconnect anything.
+
+    `release_link` unloads both entries and so removes their own shutdown jobs;
+    the domain-lifetime job is what still sets the flag and cancels the timer.
+    """
+
+    async def scenario() -> None:
+        entries = [_loaded_ble_entry("a"), _loaded_ble_entry("b")]
+        monkeypatch.setattr(integration, "is_ble_entry", lambda _e: True)
+        hass, setups = _release_link_hass(stack, entries)
+        assert await integration.async_setup(hass, {})
+        assert len(_registered_jobs(hass)) == 1, "one domain job, no entry jobs"
+
+        await integration._async_release_links(hass, 0.2)
+        assert not hass.data.get(SHUTDOWN_LATCH_KEY)
+
+        # The latch job is a callback: it has finished by the time the loop
+        # that enumerates the jobs has, ahead of any entry job's coroutine.
+        assert _run_shutdown_jobs_like_home_assistant(hass) == []
+        assert hass.data[SHUTDOWN_LATCH_KEY] is True
+
+        await asyncio.sleep(0.5)
+        assert setups == [], "a cancelled resume must not set the entries up"
+
+        # And a resume that was already due is refused by the flag too.
+        await integration._async_release_links(hass, 0.05)
+        await asyncio.sleep(0.3)
+        assert setups == []
+
+    asyncio.run(scenario())
+
+
+def test_setup_refuses_when_latched_at_entry_and_after_each_await(
+    monkeypatch, stack
+) -> None:
+    async def scenario() -> None:
+        # (1) Already latched when setup starts: nothing is even imported.
+        hass = _make_hass(stack)
+        hass.data[SHUTDOWN_LATCH_KEY] = True
+        with pytest.raises(ConfigEntryNotReady):
+            await ble.async_setup_entry(hass, FakeEntry())
+        assert _registered_jobs(hass) == []
+
+        # (2) Latched while the link is being established (inside async_start):
+        # whatever setup already started is torn down and setup refuses.
+        hass = _make_hass(stack)
+        adv = AdvertisementData(
+            local_name="EF-R31234",
+            manufacturer_data={0xB5B5: _advert_payload()},
+            service_uuids=[],
+            service_data={},
+            tx_power=None,
+            rssi=-60,
+            platform_data=(),
+        )
+        ble_device = Mock(address=ADDRESS)
+        ble_device.name = "EF-R31234"
+        monkeypatch.setattr(
+            bluetooth,
+            "async_last_service_info",
+            lambda *_a, **_k: SimpleNamespace(device=ble_device, advertisement=adv),
+        )
+        monkeypatch.setattr(
+            bluetooth, "async_ble_device_from_address", lambda *_a, **_k: None
+        )
+        monkeypatch.setattr(coordinator_module, "BLE_SETUP_READY_WAIT", 0.05)
+        jobs_at_start: list[int] = []
+        original_start = coordinator_module.EcoFlowBleCoordinator.async_start
+
+        async def start_then_latch(self):
+            # The per-entry job must already exist before the first await that
+            # can open a link, or a shutdown landing in it would miss the link.
+            jobs_at_start.append(len(_registered_jobs(hass)))
+            result = await original_start(self)
+            hass.data[SHUTDOWN_LATCH_KEY] = True
+            return result
+
+        monkeypatch.setattr(
+            coordinator_module.EcoFlowBleCoordinator, "async_start", start_then_latch
+        )
+        entry = FakeEntry()
+        with pytest.raises(ConfigEntryNotReady):
+            await ble.async_setup_entry(hass, entry)
+        assert jobs_at_start == [1]
+        assert entry.runtime_data.closing is False  # stopped, not latched-by-job
+        assert entry.runtime_data._supervisor is None, "the supervisor was stopped"
+        hass.config_entries.async_forward_entry_setups.assert_not_called()
 
     asyncio.run(scenario())

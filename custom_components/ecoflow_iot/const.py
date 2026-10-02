@@ -102,6 +102,11 @@ BLE_DISCONNECT_TIMEOUT: Final = 8.0
 # core shares 20 s between every shutdown job, and the per-entry jobs run in
 # parallel, so one slow device is capped here instead of eating the rest.
 BLE_SHUTDOWN_TIMEOUT: Final = 8.0
+# `hass.data` flag, set for the rest of the process by the first shutdown job to
+# run (the domain-lifetime latch job or any entry's job). While set, nothing
+# sets up, resumes or reconnects a Bluetooth link: Home Assistant enumerates the
+# shutdown jobs once, so a link opened after that is never released.
+SHUTDOWN_LATCH_KEY: Final = f"{DOMAIN}_shutting_down"
 # How long the link must be continuously down before the operator is told about
 # it with a repair issue. Long enough that the house's own healing has had its
 # turn - the hourly re-home and script.ble_heal_device both act well inside it -
