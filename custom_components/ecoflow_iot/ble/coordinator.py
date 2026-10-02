@@ -77,7 +77,7 @@ from ..const import (
 from ..ble_affinity import make_affinity_client_class
 from ..eflib import DeviceBase
 from ..eflib.connection import Connection
-from ..eflib.exceptions import AuthErrors
+from ..eflib.exceptions import AuthErrors, LinkClosed
 from . import link_health, unreachable
 
 _LOGGER = logging.getLogger(__name__)
@@ -147,6 +147,10 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         self._settled = asyncio.Event()
         self._auth_error: Exception | None = None
         self._hold = False
+        # Set for good by `close_for_shutdown`. Unlike `_hold` (which an unload
+        # clears and a reload sets again on a fresh instance) nothing ever
+        # clears it: once set, this object never opens a link again.
+        self._closing = False
         self._connected = False
         self._notify_scheduled = False
         self._reconnect_attempt = 0
@@ -252,6 +256,45 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
 
     # -- lifecycle --------------------------------------------------------------
 
+    @property
+    def closing(self) -> bool:
+        """Whether the link was released for good because Home Assistant is stopping."""
+        return self._closing
+
+    @callback
+    def close_for_shutdown(self) -> None:
+        """Latch the coordinator shut; the first step of releasing at shutdown.
+
+        Every path that can open a connection - the supervisor's loop and its
+        backoff, each connect attempt, entity commands - checks the latch and
+        refuses. Clearing `_hold` also silences `reconcile_unreachable_issue`, so
+        the deliberate disconnect that follows is never taken for an outage.
+        """
+        self._closing = True
+        self._hold = False
+
+    async def async_release_at_shutdown(self) -> None:
+        """Release the link while Home Assistant and its Bluetooth stack still live.
+
+        Only the link goes: no unload, no `unavailable` states written, and
+        `_connected` is left as it was so restore-state keeps the last values.
+        The supervisor is cancelled first so it cannot see the release as a
+        drop and reconnect behind us. Not bounded here - the caller bounds it.
+        """
+        self.close_for_shutdown()
+        if (supervisor := self._supervisor) is not None:
+            self._supervisor = None
+            supervisor.cancel()
+            # `wait` never raises the task's outcome, so a cancellation aimed at
+            # *us* (the shutdown budget expiring) is not swallowed by this await.
+            await asyncio.wait([supervisor])
+            if not supervisor.cancelled():
+                supervisor.exception()  # mark retrieved; nothing can act on it now
+        if self._pending_publish is not None:
+            self._pending_publish.cancel()
+            self._pending_publish = None
+        await self.device.close()
+
     async def async_start(self) -> Exception | None:
         """Start holding the link and wait a bounded time for it to come up.
 
@@ -338,6 +381,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         store = self._link_health_store()
         short_streak = link_health.get(store, self.address).streak
         while True:
+            if self._closing:
+                self._settled.set()
+                return
             if attempt:
                 self._reconnect_attempt = attempt
                 self.async_update_listeners()
@@ -356,6 +402,10 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
                 )
                 if self.config_entry.state is ConfigEntryState.LOADED:
                     self.config_entry.async_start_reauth(self.hass)
+                return
+            except LinkClosed:
+                # Released for good (shutdown): this is the end, not a failure.
+                self._settled.set()
                 return
             except DeviceNotSeen:
                 attempt += 1
@@ -411,6 +461,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
 
     async def _connect_once(self) -> None:
         """One bounded attempt at an authenticated link."""
+        if self._closing:
+            raise LinkClosed(self.address)
+
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
         )
@@ -546,6 +599,12 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         when the device pushes the new value.
         """
         executing = False
+        if self._closing:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="not_connected",
+                translation_placeholders={"name": name, "device": self.device_name},
+            )
         conn: Connection | None = None
         if not self._connected:
             raise HomeAssistantError(
@@ -559,7 +618,7 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             # not multiply the time a user waits for the one they just asked for.
             async with asyncio.timeout(BLE_COMMAND_TIMEOUT):
                 async with self._command_lock:
-                    if not self._connected:
+                    if not self._connected or self._closing:
                         raise HomeAssistantError(
                             translation_domain=DOMAIN,
                             translation_key="not_connected",
@@ -616,6 +675,8 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         time the failure surfaces here - and dropping "whatever is current" in
         that case would take down a connection this command never touched.
         """
+        if self._closing:
+            return
         if conn is None or self.device.current_connection is not conn:
             _LOGGER.debug(
                 "%s: %s failed on a link the supervisor already replaced; "

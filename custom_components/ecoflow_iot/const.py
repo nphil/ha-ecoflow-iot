@@ -98,6 +98,10 @@ BLE_COMMAND_TIMEOUT: Final = 15.0
 # Outer bound on releasing a link. Bleak's own disconnect is already capped, but
 # a wedged transport can stall inside it and unload must never hang on that.
 BLE_DISCONNECT_TIMEOUT: Final = 8.0
+# Budget for one entry's release of its link when Home Assistant shuts down. The
+# core shares 20 s between every shutdown job, and the per-entry jobs run in
+# parallel, so one slow device is capped here instead of eating the rest.
+BLE_SHUTDOWN_TIMEOUT: Final = 8.0
 # How long the link must be continuously down before the operator is told about
 # it with a repair issue. Long enough that the house's own healing has had its
 # turn - the hourly re-home and script.ble_heal_device both act well inside it -

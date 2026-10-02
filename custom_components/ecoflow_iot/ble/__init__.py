@@ -8,7 +8,9 @@ the integration root, so the root modules dispatch here for BLE entries.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from collections.abc import Callable
 
 from homeassistant.components import bluetooth
@@ -20,7 +22,7 @@ from homeassistant.components.bluetooth import (
 )
 from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HassJob, HomeAssistant, callback
 from homeassistant.helpers.importlib import async_import_module
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
@@ -29,6 +31,7 @@ from homeassistant.exceptions import (
 )
 
 from ..const import (
+    BLE_SHUTDOWN_TIMEOUT,
     CONF_ADDRESS,
     CONF_DEVICE_NAME,
     CONF_LOCAL_NAME,
@@ -59,6 +62,11 @@ PLATFORMS: list[Platform] = [
 ]
 
 _REAPPEAR_KEY = f"{DOMAIN}_ble_reappear"
+# Set (in `hass.data`, so for the life of the process) by the first shutdown job
+# to run. Entries that held no link when it ran - one still waiting for its
+# device to advertise - would otherwise be set up by a late advertisement and
+# open a link nobody will release.
+_SHUTDOWN_KEY = f"{DOMAIN}_ble_shutdown"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> bool:
@@ -67,6 +75,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
     # protobuf and the crypto stack, and the crypto import's ctypes/libgmp
     # probing never lands on the event loop.
     eflib = await async_import_module(hass, f"{__package__.rpartition('.')[0]}.eflib")
+    if hass.data.get(_SHUTDOWN_KEY):
+        raise ConfigEntryNotReady("Home Assistant is shutting down")
 
     address: str = entry.data[CONF_ADDRESS]
     serial: str = entry.data[CONF_SERIAL]
@@ -137,6 +147,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
         user_id=entry.data.get(CONF_USER_ID),
     )
     coordinator.configure(update_period=_update_period(entry))
+    # One job per entry, registered as soon as the object holding the link
+    # exists, so a shutdown that lands mid-setup still releases it. HA runs the
+    # jobs of all entries in parallel, before it stops the Bluetooth stack.
+    # `async_on_unload` also removes the job when setup fails or the entry unloads.
+    async def _release_at_shutdown() -> None:
+        await _async_release_at_shutdown(hass, entry, coordinator)
+
+    entry.async_on_unload(
+        hass.async_add_shutdown_job(
+            HassJob(
+                _release_at_shutdown,
+                f"{DOMAIN} release BLE link {entry.title}",
+            )
+        )
+    )
 
     if (auth_error := await coordinator.async_start()) is not None:
         await coordinator.async_stop()
@@ -172,6 +197,54 @@ async def async_unload_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) 
     if (coordinator := getattr(entry, "runtime_data", None)) is not None:
         await coordinator.async_stop()
     return unloaded
+
+
+async def _async_release_at_shutdown(
+    hass: HomeAssistant,
+    entry: EcoFlowBleConfigEntry,
+    coordinator: EcoFlowBleCoordinator,
+) -> None:
+    """Release one entry's Bluetooth link as Home Assistant begins to shut down.
+
+    Home Assistant runs this (stage 1 of its stop sequence, all entries in
+    parallel) while the `bluetooth` stack and the proxies' API connections are
+    still alive. Waiting for the later stop event is too late: the stack goes
+    down on that same event, and the links die uncompleted - ghost links.
+
+    The order is the point. Latch first, so nothing can open a link behind the
+    release; then silence the outage watchers, so the deliberate disconnect is
+    never recorded as an outage and no repair is raised or deleted; only then
+    drop the link. The entry is deliberately NOT unloaded - that would write a
+    wave of `unavailable` states over the values restore-state is about to
+    keep. Bounded, and it never raises: a failure here must not hold up the
+    shutdown (a NameError in this path once aborted a whole restart).
+    """
+    hass.data[_SHUTDOWN_KEY] = True
+    started = time.monotonic()
+    try:
+        coordinator.close_for_shutdown()
+        _cancel_reappear_callback(hass, entry)
+        unreachable.async_cancel(hass, entry)
+        async with asyncio.timeout(BLE_SHUTDOWN_TIMEOUT):
+            await coordinator.async_release_at_shutdown()
+    except TimeoutError:
+        _LOGGER.warning(
+            "Releasing the BLE link to %s did not finish within %.0f s at shutdown",
+            coordinator.device_name,
+            BLE_SHUTDOWN_TIMEOUT,
+        )
+    except Exception as err:  # noqa: BLE001 - a shutdown job must never raise
+        _LOGGER.warning(
+            "Could not release the BLE link to %s at shutdown: %s",
+            coordinator.device_name,
+            err,
+        )
+    else:
+        _LOGGER.info(
+            "Released BLE link to %s at shutdown in %.2f s",
+            coordinator.device_name,
+            time.monotonic() - started,
+        )
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> None:
@@ -218,6 +291,8 @@ def _register_reappear_callback(
         service_info: BluetoothServiceInfoBleak, change: BluetoothChange
     ) -> None:
         _cancel_reappear_callback(hass, entry)
+        if hass.data.get(_SHUTDOWN_KEY):
+            return  # shutting down: a new link now would never be released
         # The entry may have been removed or reloaded while we were waiting; only
         # a still-retrying entry has anything to gain from being retried now.
         current = hass.config_entries.async_get_entry(entry.entry_id)

@@ -22,6 +22,10 @@ class ConnectionTimeout(TimeoutError):
     """Connection timeout reached"""
 
 
+class LinkClosed(Exception):
+    """The link was closed for good (Home Assistant is shutting down)"""
+
+
 class MaxConnectionAttemptsReached(Exception):
     """Device could not complete initial connection after maximum attempts"""
 

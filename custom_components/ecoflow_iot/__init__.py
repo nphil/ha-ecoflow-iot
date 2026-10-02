@@ -217,25 +217,32 @@ async def _async_add_resource(hass: HomeAssistant, retries: int = 12) -> None:
 # release_link - clean teardown before Home Assistant goes away
 # ---------------------------------------------------------------------------
 #
-# Home Assistant does NOT unload config entries on shutdown: it fires
-# EVENT_HOMEASSISTANT_STOP and the `bluetooth` integration tears its stack down
-# concurrently, so held GATT links die without a completed disconnect. The
-# peripheral keeps believing it is connected, stops advertising, and answers
-# nobody - a ghost link Home Assistant cannot see because the proxy reports its
-# slots free (measured 2026-09-09/10: an HA restart wedged three devices; only
-# rebooting the proxy holding each stale link freed them).
+# Home Assistant does NOT unload config entries on shutdown, and the
+# `bluetooth` integration tears its stack down on EVENT_HOMEASSISTANT_STOP, so
+# a release made on that event loses the race: held GATT links die without a
+# completed disconnect. The peripheral keeps believing it is connected, stops
+# advertising, and answers nobody - a ghost link Home Assistant cannot see
+# because the proxy reports its slots free (measured 2026-09-09/10: an HA
+# restart wedged three devices; only rebooting the proxy holding each stale
+# link freed them).
 #
 # Nothing on the proxy side covers this any more: ESPHome 2026.09.14 removed the
 # on-API-loss release hook, and rebooting a proxy is not a cure either - it
 # re-rolls the dice (2026-09-17: 2 of 6 proxies re-ghosted on their first
-# post-reboot connection). The only clean path is to drop the link while HA and
-# its Bluetooth stack are both still alive, which is what this action does:
-# `script.safe_restart` calls it on every BLE integration and only then restarts
-# Core. A ghost that forms anyway is caught by `automation.ble_ghost_link_detector`
-# and freed with the holding proxy's `force_disconnect_orphan` action. Implemented by
-# unloading the entry, because the BLE coordinator's async_stop (run by async_unload_entry) cancels the link
-# supervisor before releasing, so the release cannot be observed as a drop and
-# reconnected behind us. Cloud entries are skipped: they hold no BLE link.
+# post-reboot connection). So the link is dropped while HA and its Bluetooth
+# stack are both still alive. Home Assistant runs shutdown jobs (stage 1 of its
+# stop sequence) BEFORE it fires EVENT_HOMEASSISTANT_STOP, so every BLE entry
+# registers one (`ble._async_release_at_shutdown`) and any restart or stop
+# releases its link cleanly. A ghost that forms anyway is caught by
+# `automation.ble_ghost_link_detector` and freed with the holding proxy's
+# `force_disconnect_orphan` action.
+#
+# This action is the same release done on demand, kept for `script.safe_restart`
+# and for an operator who wants a link dropped without restarting. Unlike the
+# shutdown job it unloads the entry, because the BLE coordinator's async_stop
+# (run by async_unload_entry) cancels the link supervisor before releasing, so
+# the release cannot be observed as a drop and reconnected behind us. Cloud
+# entries are skipped: they hold no BLE link.
 #
 # `resume_after` sets the entry up again if no restart follows, so an operator
 # who calls this and changes their mind is not left with a dead device that

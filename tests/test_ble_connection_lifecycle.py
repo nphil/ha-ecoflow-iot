@@ -18,6 +18,8 @@ from pathlib import Path
 from types import ModuleType
 from unittest.mock import Mock
 
+import pytest
+
 from bleak.backends.scanner import AdvertisementData
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -37,7 +39,11 @@ from custom_components.ecoflow_iot.eflib.connection import (  # noqa: E402
     Connection,
     ConnectionState,
 )
-from custom_components.ecoflow_iot.eflib.exceptions import ConnectionTimeout  # noqa: E402
+from custom_components.ecoflow_iot.eflib.exceptions import (  # noqa: E402
+    ConnectionTimeout,
+    LinkClosed,
+    NotConnectedError,
+)
 
 ADDRESS = "AA:BB:CC:DD:EE:FF"
 ENCRYPT_TYPE_USER_ID = 0b0111000
@@ -307,3 +313,135 @@ def test_disconnect_on_an_already_disconnected_device_does_not_log_an_error(
     with caplog.at_level(logging.DEBUG):
         asyncio.run(device.disconnect())  # never connected: the double-disconnect case
     assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+# ------------------------------------------------- close() (shutdown latch) ---
+
+
+def _patch_establish(monkeypatch, calls: list, client=None):
+    async def fake_establish_connection(_client_class, _ble_device, _name, **_kw):
+        calls.append(1)
+        return client or _FakeBleakClient()
+
+    monkeypatch.setattr(
+        connection_module, "establish_connection", fake_establish_connection
+    )
+    monkeypatch.setattr(connection_module, "close_stale_connections_by_address", _noop)
+
+
+def test_closed_device_refuses_every_later_connect(monkeypatch) -> None:
+    """After `close()` nothing - supervisor, retry, stray caller - can reconnect.
+
+    `disconnect()` stays reversible on purpose (the supervisor reconnects after
+    it); only `close()` is final, and it is what Home Assistant's shutdown job
+    uses so that no connect can slip in while the Bluetooth stack goes away.
+    """
+
+    async def scenario() -> None:
+        attempts: list = []
+        _patch_establish(monkeypatch, attempts)
+
+        device = _make_device()
+        await device.close()  # never connected: the latch alone must hold
+        with pytest.raises(LinkClosed):
+            await device.connect(user_id="1234567890")
+        assert attempts == []
+
+        live = _make_device()
+        await live.connect(user_id="1234567890")
+        assert len(attempts) == 1
+        conn = live.current_connection
+        await live.close()
+        assert live.current_connection is None and not conn.is_connected
+        with pytest.raises(LinkClosed):
+            await live.connect(user_id="1234567890")
+        assert len(attempts) == 1
+
+    asyncio.run(scenario())
+
+
+def test_close_during_a_connect_still_establishing_drops_that_link(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        established = asyncio.Event()
+        gate = asyncio.Event()
+        client = _FakeBleakClient()
+
+        async def fake_establish_connection(_client_class, _ble_device, _name, **_kw):
+            established.set()
+            await gate.wait()
+            return client
+
+        monkeypatch.setattr(
+            connection_module, "establish_connection", fake_establish_connection
+        )
+        monkeypatch.setattr(
+            connection_module, "close_stale_connections_by_address", _noop
+        )
+
+        device = _make_device()
+        task = asyncio.create_task(device.connect(user_id="1234567890"))
+        await asyncio.wait_for(established.wait(), timeout=1.0)
+        await device.close()
+        gate.set()
+        await asyncio.wait_for(task, timeout=1.0)
+
+        assert client.disconnect_calls >= 1 and not client.is_connected
+        assert device.is_closing
+
+    asyncio.run(scenario())
+
+
+def test_a_closed_connection_never_reconnects_or_writes(monkeypatch) -> None:
+    """A late disconnect callback or a send retry must not reopen/touch the link."""
+
+    async def scenario() -> None:
+        attempts: list = []
+        _patch_establish(monkeypatch, attempts)
+
+        conn = _make_connection()
+        conn._reconnect = True
+        conn._retry_on_disconnect_delay = 0.01
+        conn._reconnect_attempt = 1  # keeps the delay chosen above
+        await conn.close()
+
+        # Even if something re-arms the retry flag after the close, the
+        # reconnect task bails out instead of connecting.
+        conn._retry_on_disconnect = True
+        await conn.reconnect()
+        assert attempts == []
+
+        writes: list = []
+        conn._client = Mock(is_connected=True)
+        conn._client.write_gatt_char = lambda *a, **k: writes.append(a)
+        with pytest.raises(NotConnectedError):
+            await conn.send_request(b"payload", raise_on_failure=True)
+        await conn.send_request(b"payload")
+        assert writes == []
+
+    asyncio.run(scenario())
+
+
+def test_close_stops_a_send_retry_that_is_sleeping(monkeypatch) -> None:
+    async def scenario() -> None:
+        conn = _make_connection()
+        attempts = {"n": 0}
+
+        async def failing_send(_data, *, raise_on_failure=False):
+            attempts["n"] += 1
+            raise OSError("write failed")
+
+        conn._send_request = failing_send
+        conn._client = Mock(is_connected=True)
+        sender = asyncio.create_task(
+            conn.send_request(b"payload", raise_on_failure=True)
+        )
+        await asyncio.sleep(0.05)  # first attempt failed; now sleeping before retry 2
+        assert attempts["n"] == 1
+        conn._closing = True
+        with pytest.raises(NotConnectedError):
+            await asyncio.wait_for(sender, timeout=3.0)
+        assert attempts["n"] == 1
+
+    asyncio.run(scenario())

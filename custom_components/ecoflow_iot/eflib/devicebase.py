@@ -22,7 +22,7 @@ from .connection import (
     PacketReceivedListener,
     SessionKeyDerivedListener,
 )
-from .exceptions import NotConnectedError
+from .exceptions import LinkClosed, NotConnectedError
 from .listeners import ListenerGroup, ListenerRegistry
 from .logging_util import (
     ConnectionLog,
@@ -139,6 +139,8 @@ class DeviceBase(abc.ABC):
         self._seen_packet_shapes: set[tuple[int, ...]] = set()
 
         self._reconnect_disabled = False
+        # Set for good by `close()`; see `Connection.close`.
+        self._closing = False
         self._options = Connection.Options()
         self._diagnostics = DeviceDiagnosticsCollector(self)
 
@@ -435,6 +437,8 @@ class DeviceBase(abc.ABC):
         client_class: type | None = None,
     ):
         Connection.validate_user_id(user_id)
+        if self._closing:
+            raise LinkClosed(f"{self.name}: closed; refusing to connect")
 
         if self._conn is None:
             self._conn = (
@@ -495,6 +499,26 @@ class DeviceBase(abc.ABC):
         if self._conn is conn:
             self._connection_event.clear()
             self._conn = None
+
+    async def close(self):
+        """Disconnect and refuse every later connect, reconnect and send retry.
+
+        For the one moment a link must be released for good (process shutdown):
+        `disconnect()` leaves the device free to connect again, which is exactly
+        what must not happen while the Bluetooth stack is being torn down.
+        """
+        self._closing = True
+        conn = self._conn
+        if conn is None:
+            return
+        await conn.close(reason=caller_chain())
+        if self._conn is conn:
+            self._connection_event.clear()
+            self._conn = None
+
+    @property
+    def is_closing(self) -> bool:
+        return self._closing
 
     async def wait_connected(self, timeout: int = 20):
         if self._conn is None:

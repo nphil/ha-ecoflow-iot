@@ -31,6 +31,7 @@ from .exceptions import (
     AuthErrors,
     ConnectionTimeout,
     FailedToAuthenticate,
+    LinkClosed,
     MaxConnectionAttemptsReached,
     MaxReconnectAttemptsReached,
     NotConnectedError,
@@ -287,6 +288,11 @@ class Connection:
         # in the 2026-09-24 audit: without this, a stale command's teardown
         # racing the supervisor's next connect orphaned the newer link.
         self._abort_pending_connect = False
+        # Set for good by `close()`: this connection never connects, reconnects,
+        # authenticates or retries a send again. `disconnect()` alone is
+        # reversible (the next `connect()` works), so it cannot be what stops a
+        # retry loop running while the process is being torn down.
+        self._closing = False
         self._connected = asyncio.Event()
         self._disconnected = asyncio.Event()
         self._retry_on_disconnect = False
@@ -410,6 +416,9 @@ class Connection:
         self,
         max_attempts: int | None = None,
     ):
+        if self._closing:
+            raise LinkClosed("connection closed; refusing to connect")
+
         # `_reconnect` sets RECONNECTING before calling in, and that counts as
         # connecting, so it has to be let through.
         if self._state.is_connecting and self._state != ConnectionState.RECONNECTING:
@@ -476,7 +485,7 @@ class Connection:
                     max_attempts=ble_attempts,
                     timeout=self._options.timeout,
                 )
-            if self._abort_pending_connect:
+            if self._abort_pending_connect or self._closing:
                 # A disconnect() arrived while establish_connection() was still
                 # running - too late to cancel from there (that coroutine is not
                 # ours to cancel; it belongs to whoever is awaiting `connect()`),
@@ -601,6 +610,9 @@ class Connection:
         self._reconnect_task.add_done_callback(_reconnect_done)
 
     async def reconnect(self) -> None:
+        if self._closing:
+            return
+
         # Wait before reconnect
         if self._reconnect_attempt == 0:
             self._retry_on_disconnect_delay = 10
@@ -629,7 +641,7 @@ class Connection:
             MAX_RECONNECT_ATTEMPTS,
         )
         await asyncio.sleep(self._retry_on_disconnect_delay)
-        if not self._retry_on_disconnect:
+        if not self._retry_on_disconnect or self._closing:
             self._logger.warning("Reconnect is aborted")
             return
 
@@ -662,6 +674,20 @@ class Connection:
         self._client = None
         if self._state == ConnectionState.DISCONNECTING:
             self._set_state(ConnectionState.DISCONNECTED, reason=reason)
+
+    async def close(self, reason: str | None = None) -> None:
+        """Disconnect and refuse every later connect, reconnect, auth step or retry.
+
+        The latch is set before anything is torn down, so nothing woken by the
+        teardown (the disconnect callback, a send retry sleeping, an auth stage)
+        can open a link behind it. Irreversible for this object.
+        """
+        self._closing = True
+        await self.disconnect(reason=reason or "closing")
+
+    @property
+    def is_closing(self) -> bool:
+        return self._closing
 
     async def _disconnect_client(self) -> None:
         if self._client is None or not self._client.is_connected:
@@ -760,6 +786,8 @@ class Connection:
     async def _run_auth(self) -> None:
         """Drive the whole authentication procedure for this connection"""
         client = self._client
+        if self._closing:
+            return
         try:
             match self._encrypt_type:
                 case 0:
@@ -1437,12 +1465,22 @@ class Connection:
             raise NotConnectedError("Cannot send command: device is not connected")
 
     async def send_request(self, send_data: bytes, *, raise_on_failure: bool = False):
+        if self._closing:
+            if raise_on_failure:
+                raise NotConnectedError("Cannot send command: connection is closed")
+            return
+
         self._logger.log_filtered(LogOptions.CONNECTION_DEBUG, "Sending: %r", send_data)
         self._listeners.on_data_send(send_data)
 
         # In case exception happens we need to try again
         err = None
         for retry in range(4):
+            if self._closing:
+                # Closed while a retry slept: never write to a link being torn down.
+                if raise_on_failure:
+                    raise NotConnectedError("Cannot send command: connection is closed")
+                return
             try:
                 await self._send_request(send_data, raise_on_failure=raise_on_failure)
             except Exception as e:
