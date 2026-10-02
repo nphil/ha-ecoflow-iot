@@ -243,7 +243,7 @@ async def _async_add_resource(hass: HomeAssistant, retries: int = 12) -> None:
 # `automation.ble_ghost_link_detector` and freed with the holding proxy's
 # `force_disconnect_orphan` action.
 #
-# This action is the same release done on demand, kept for `script.safe_restart`
+# This action is the same release done on demand, kept for `script.ble_restart_proxy`
 # and for an operator who wants a link dropped without restarting. Unlike the
 # shutdown job it unloads the entry, because the BLE coordinator's async_stop
 # (run by async_unload_entry) cancels the link supervisor before releasing, so
