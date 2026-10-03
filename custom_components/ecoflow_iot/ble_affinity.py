@@ -162,6 +162,40 @@ def _best_available(
     return max(candidates, key=lambda device: device.advertisement.rssi)
 
 
+def _release_unused_slot(manager: Any, backend: Any) -> None:
+    """Give back the connection slot habluetooth reserved for a backend we discard.
+
+    Building a backend for a *local* adapter reserves one of that adapter's
+    connection slots (`_async_get_backend_for_ble_device` calls
+    `manager.async_allocate_connection_slot`); a proxy's backend reserves nothing,
+    its slot accounting living on the proxy. Normally the reservation comes back
+    through `connect()` (which releases it when that backend's connect fails) or
+    through the adapter's BlueZ watcher (when the device disconnects). A backend
+    nobody connects with does neither - the device never connected, so no
+    disconnect event ever fires - and the slot would stay taken for good: the
+    adapter loses capacity for every device it serves, and the allocation list a
+    Connection sensor reads keeps naming it as holding this one. So whoever
+    discards a built backend has to hand its slot back.
+
+    "Local" is judged exactly as `connect()` judges it: an empty `source`. Never
+    raises - routing must not fail over housekeeping.
+    """
+    if getattr(backend, "source", None):
+        return
+    device = getattr(backend, "device", None)
+    release = getattr(manager, "async_release_connection_slot", None)
+    if device is None or release is None:
+        return
+    try:
+        release(device)
+    except Exception:  # noqa: BLE001 - see the docstring
+        _LOGGER.debug(
+            "%s: could not release the slot reserved for a backend that was not used",
+            getattr(device, "address", "?"),
+            exc_info=True,
+        )
+
+
 def make_affinity_client_class(
     base: type,
     preferred_getter: Callable[[], str | None],
@@ -338,6 +372,10 @@ def make_affinity_client_class(
                     manager, alt.scanner, alt.ble_device
                 )
                 if backend is not None:
+                    # `default_select` had already built (and, for a local
+                    # adapter, reserved a slot for) the backend being replaced;
+                    # nothing will ever connect with it, so give the slot back.
+                    _release_unused_slot(manager, default_backend)
                     _LOGGER.info(
                         "%s: default routing chose %s, which %s; using %s instead",
                         address,

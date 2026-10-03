@@ -51,6 +51,7 @@ from custom_components.ecoflow_iot.eflib.connection import (  # noqa: E402
 from custom_components.ecoflow_iot.ble.bounded_client import (  # noqa: E402
     make_bounded_client_class,
 )
+from custom_components.ecoflow_iot.const import BLE_CONNECT_TIMEOUT  # noqa: E402
 from custom_components.ecoflow_iot.eflib.encryption import Type7Encryption  # noqa: E402
 from custom_components.ecoflow_iot.eflib.exceptions import (  # noqa: E402
     ConnectionTimeout,
@@ -628,7 +629,9 @@ def test_a_gatt_cache_clear_that_hangs_does_not_hold_up_the_failed_connect(
     asyncio.run(scenario())
 
 
-def _stalling_client_class(calls: list[int]) -> type:
+def _stalling_client_class(
+    calls: list[int], timeouts: list[float | None] | None = None
+) -> type:
     """What `establish_connection` instantiates; its first `connect()` never answers."""
 
     class FirstConnectStalls(_FakeBleakClient):
@@ -636,8 +639,10 @@ def _stalling_client_class(calls: list[int]) -> type:
             super().__init__()
             self.is_connected = False
 
-        async def connect(self, **_kwargs) -> None:
+        async def connect(self, **kwargs) -> None:
             calls.append(len(calls) + 1)
+            if timeouts is not None:
+                timeouts.append(kwargs.get("timeout"))
             if len(calls) == 1:
                 await asyncio.Event().wait()
             self.is_connected = True
@@ -660,9 +665,13 @@ def test_a_stalled_connect_attempt_leaves_room_for_the_retry_that_follows(
 
     async def scenario() -> None:
         calls: list[int] = []
+        timeouts: list[float | None] = []
         failures: list[BaseException] = []
         client_class = make_bounded_client_class(
-            _stalling_client_class(calls), timeout=0.3, on_failure=failures.append
+            _stalling_client_class(calls, timeouts),
+            timeout=0.3,
+            backend_timeout=0.24,
+            on_failure=failures.append,
         )
         monkeypatch.setattr(
             connection_module, "close_stale_connections_by_address", _noop
@@ -675,6 +684,9 @@ def test_a_stalled_connect_attempt_leaves_room_for_the_retry_that_follows(
         elapsed = time.monotonic() - started
 
         assert calls == [1, 2], "the retry must actually run"
+        # `establish_connection` asks for its own 20 s every time; each attempt
+        # is handed the shorter backend timeout instead.
+        assert timeouts == [0.24, 0.24]
         assert [type(failure) for failure in failures] == [TimeoutError]
         assert conn.is_connected
         assert elapsed < 1.5, "not the 2 s whole-call cap the stalled attempt burned"
@@ -711,7 +723,7 @@ def test_a_cancelled_attempt_is_not_reported_as_a_failed_one() -> None:
     async def scenario() -> None:
         failures: list[BaseException] = []
         client = make_bounded_client_class(
-            Hangs, timeout=5.0, on_failure=failures.append
+            Hangs, timeout=5.0, backend_timeout=4.0, on_failure=failures.append
         )()
         attempt = asyncio.create_task(client.connect())
         await asyncio.sleep(0.05)
@@ -732,7 +744,164 @@ def test_a_failing_report_never_masks_the_connect_error() -> None:
         raise RuntimeError("bookkeeping bug")
 
     client = make_bounded_client_class(
-        Refused, timeout=1.0, on_failure=broken_report
+        Refused, timeout=1.0, backend_timeout=0.8, on_failure=broken_report
     )()
     with pytest.raises(BleakError, match="no free slot"):
         asyncio.run(client.connect())
+
+
+# --------------- startup contract S8: the backend's own timeout fires first ---
+#
+# aioesphomeapi 46.2.0's `bluetooth_gatt_start_notify` (under bleak-esphome 4.0.0)
+# registers the notification handler BEFORE the proxy acknowledges and removes it only
+# on `except Exception`, never on cancellation. A guard that cancels a stalled
+# subscribe from outside therefore leaves a handler registered on the proxy's
+# connection, delivering notifications to stale objects until it resets. The fix is to
+# hand the backend a `timeout` of its own, shorter than the guard, so it raises and
+# cleans up first; the guard stays as the safety net for backends that ignore it.
+
+_GUARD = 1.0  # the step guard used by the behavioural tests below
+
+
+class _ProxyClient(_FakeBleakClient):
+    """How an ESPHome proxy backend treats a notification subscribe it is never answered.
+
+    Mirrors `bluetooth_gatt_start_notify` as bleak-esphome calls it: the handler is
+    registered before the proxy acknowledges, the wait is bounded by the ``timeout``
+    kwarg (bleak-esphome defaults to 30 s when none is passed), and the handler is
+    removed on an Exception - not on a cancellation.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.handlers: list = []
+        self.timeouts: list[float] = []
+
+    async def start_notify(self, _characteristic, callback, **kwargs) -> None:
+        timeout = kwargs.get("timeout", 30.0)
+        self.timeouts.append(timeout)
+        self.handlers.append(callback)
+        try:
+            async with asyncio.timeout(timeout):
+                await asyncio.Event().wait()  # the proxy never acknowledges
+        except Exception:
+            self.handlers.remove(callback)
+            raise
+
+
+def test_a_subscribe_never_acknowledged_is_handed_a_backend_timeout_inside_its_guard(
+    monkeypatch,
+) -> None:
+    """With the production guard: the backend gets 4 s, so the subscribe's two proxy
+    round trips (subscribe, then the CCCD write) fit inside the 10 s guard."""
+
+    async def scenario() -> None:
+        client = _ProxyClient()
+        _patch_establish(monkeypatch, [], client)
+        conn = _make_connection()
+        _as_the_coordinator_runs_it(conn, timeout=BLE_CONNECT_TIMEOUT)
+        attempt = asyncio.create_task(conn.connect(max_attempts=2))
+        try:
+            async with asyncio.timeout(2.0):
+                while not client.timeouts:
+                    await asyncio.sleep(0.01)
+            (backend_timeout,) = client.timeouts
+            assert backend_timeout == 4.0
+            assert 2 * backend_timeout < BLE_CONNECT_TIMEOUT
+        finally:
+            attempt.cancel()
+            try:
+                await attempt
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+
+def test_a_stalled_proxy_subscribe_ends_by_the_backends_timeout_leaving_no_handler(
+    monkeypatch, caplog
+) -> None:
+    async def scenario() -> None:
+        client = _ProxyClient()
+        _patch_establish(monkeypatch, [], client)
+        conn = _make_connection()
+        _as_the_coordinator_runs_it(conn, timeout=_GUARD)
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(conn.connect(max_attempts=2), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < _GUARD * 0.9, "the backend's own timeout must end it, not the guard"
+        assert client.handlers == [], "a handler was left registered on the proxy"
+        assert client.disconnect_calls == 1 and not client.is_connected
+        assert any(
+            record.levelno == logging.WARNING and "subscribe" in record.getMessage()
+            for record in caplog.records
+        )
+
+    asyncio.run(scenario())
+
+
+def test_each_connect_attempt_is_handed_a_backend_timeout_shorter_than_its_guard() -> None:
+    seen: list[dict] = []
+
+    class Backend:
+        async def connect(self, **kwargs) -> None:
+            seen.append(kwargs)
+
+    client = make_bounded_client_class(
+        Backend, timeout=10.0, backend_timeout=8.0, on_failure=lambda _error: None
+    )()
+
+    async def scenario() -> None:
+        # What `establish_connection` passes: its own 20 s, and a cache hint.
+        await client.connect(timeout=20.0, dangerous_use_bleak_cache=True)
+        await client.connect()
+        await client.connect(timeout=3.0)  # a caller that wants less keeps it
+
+    asyncio.run(scenario())
+
+    assert seen == [
+        {"timeout": 8.0, "dangerous_use_bleak_cache": True},
+        {"timeout": 8.0},
+        {"timeout": 3.0},
+    ]
+
+    for bad in (10.0, 12.0, 0.0):
+        with pytest.raises(ValueError):
+            make_bounded_client_class(
+                Backend, timeout=10.0, backend_timeout=bad, on_failure=lambda _e: None
+            )
+
+
+def test_a_stalled_connect_ends_by_the_backends_timeout_so_it_can_clean_up() -> None:
+    """Mirrors aioesphomeapi's connect: bounded by ``timeout``, and on that timeout it
+    tells the proxy to drop the half-made connection and waits for the slot before
+    raising - a path a cancellation does not take."""
+
+    class Backend:
+        def __init__(self) -> None:
+            self.cleaned_up = False
+
+        async def connect(self, **kwargs) -> None:
+            try:
+                async with asyncio.timeout(kwargs.get("timeout", 30.0)):
+                    await asyncio.Event().wait()
+            except Exception:
+                self.cleaned_up = True
+                raise
+
+    async def scenario() -> None:
+        failures: list[BaseException] = []
+        client = make_bounded_client_class(
+            Backend, timeout=_GUARD, backend_timeout=_GUARD * 0.4, on_failure=failures.append
+        )()
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await client.connect(timeout=20.0)
+        assert time.monotonic() - started < _GUARD * 0.9
+        assert client.cleaned_up
+        assert [type(failure) for failure in failures] == [TimeoutError]
+
+    asyncio.run(scenario())

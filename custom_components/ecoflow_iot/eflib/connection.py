@@ -61,6 +61,34 @@ DISCONNECT_TIMEOUT = 5.0
 # Waited before DISCONNECT_TIMEOUT rather than inside it, so a teardown costs the sum
 PUMP_STOP_TIMEOUT = 1.0
 
+# Share of a step's guard (`Options.timeout`) handed to the Bluetooth backend as its *own*
+# timeout, so a stalled call fails by itself - running the backend's cleanup - before the
+# guard has to cancel it. See `backend_timeout_for`.
+BACKEND_TIMEOUT_SHARE = 0.8
+# A notification subscribe makes up to two proxy round trips: the subscribe itself and,
+# on connections that cache GATT (bleak-esphome's REMOTE_CACHING), the CCCD write after it.
+NOTIFY_ROUND_TRIPS = 2
+
+
+def backend_timeout_for(guard: float, round_trips: int = 1) -> float:
+    """The `timeout=` to hand a backend call that is also guarded from outside by ``guard`` s.
+
+    Cancelling a call from outside is the last resort, not the plan. ESPHome proxies are why:
+    aioesphomeapi's `bluetooth_gatt_start_notify` (46.2.0, under bleak-esphome 4.0.0) registers
+    the notification handler *before* the proxy acknowledges and removes it only on
+    `except Exception`, never on cancellation - so a guard that cancels a stalled subscribe
+    leaves a handler registered on the proxy's connection, which goes on delivering
+    notifications to stale objects until that API connection resets. Handing the call a timeout
+    of its own makes it raise instead, and its own error path unregisters the handler.
+
+    bleak-esphome applies the value to *each* round trip, so ``round_trips`` shares it out.
+    The BlueZ and other backends ignore it; for them the guard is what bounds the call.
+    ``BACKEND_TIMEOUT_SHARE`` of the guard is used, leaving the rest as room for the backend to
+    unwind itself before the guard fires: for a 10 s guard that is 8 s, or 4 s a round trip
+    across a subscribe's two.
+    """
+    return guard * BACKEND_TIMEOUT_SHARE / round_trips
+
 
 _BT_PROTOCOL_UUIDS = {
     "rfcomm": {
@@ -555,6 +583,13 @@ class Connection:
             # stack's own timeout for it is far longer than a healthy link needs
             # (live 2026-10-02: 20 s, then GATT error 133). Unbounded, the whole link
             # waits that out before the retry even gets started.
+            #
+            # Bounded twice, on purpose. `_start_notify` hands the backend a timeout
+            # of its own that is shorter than this guard, so a stalled proxy makes the
+            # call raise and its own error path runs; cancelling it from here would
+            # leave the proxy's notification handler registered (see
+            # `backend_timeout_for`). This guard is the safety net for backends that
+            # ignore that timeout, BlueZ among them.
             async with asyncio.timeout(self._options.timeout):
                 await self._start_notify(self._on_notification)
         except Exception as e:  # noqa: BLE001 - any subscribe failure is fatal here
@@ -816,6 +851,11 @@ class Connection:
             # ESPHome proxy a GATT write it never answers (retried four times by
             # `send_request`) used to hold the handshake for as long as the stack's
             # own timeouts allowed - the caller's overall cap was all that ended it.
+            # These stages are guarded by cancellation alone, deliberately: bleak's
+            # `write_gatt_char` takes no timeout to hand the backend, and aioesphomeapi
+            # removes a request's response handler in a `finally`, so a cancelled write
+            # leaves nothing registered behind it (the subscribe, which does, is
+            # different - see `backend_timeout_for`).
             match self._encrypt_type:
                 case 0:
                     async with asyncio.timeout(self._options.timeout):
@@ -1074,7 +1114,12 @@ class Connection:
     async def _start_notify(self, callback: Callable):
         assert self._client is not None
 
-        kwargs = {}
+        # The backend's own timeout, shorter than the guard `connect` holds this call
+        # to - see `backend_timeout_for`. ESPHome proxies apply it to each round trip
+        # of the subscribe; other backends ignore it.
+        kwargs: dict[str, Any] = {
+            "timeout": backend_timeout_for(self._options.timeout, NOTIFY_ROUND_TRIPS)
+        }
         if self._options.bluez_start_notify:
             kwargs["bluez"] = {"use_start_notify": True}
         await self._client.start_notify(self._notify_characteristic, callback, **kwargs)

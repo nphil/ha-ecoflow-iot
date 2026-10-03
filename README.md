@@ -466,13 +466,20 @@ finding a dashboard full of settings.
 - **No connecting step waits longer than 10 seconds.** One connect attempt, the
   notification subscribe and each stage of the handshake are each capped at 10 s, because
   the Bluetooth stack's own timeouts are much longer — a proxy that accepted the link and
-  then never answered the subscribe used to hold it up for 20 s.
+  then never answered the subscribe used to hold it up for 20 s. The proxy is also given a
+  shorter time of its own (8 s to connect, 4 s for each half of the subscribe), so it ends
+  a stalled step itself and cleans up after it, rather than being cut off from outside —
+  which, for the subscribe, would leave a stale listener registered on the proxy. The 10 s
+  cap stays as the safety net. If the task that holds a link is ever torn down on its own
+  while the link is healthy, the link is released before the task exits.
 - **A stalled attempt moves on to a different proxy.** When an attempt through one proxy
   stalls or fails, the next one — the retry inside the same pass included, and also when
   you have chosen a preferred proxy — goes through another proxy that can hear the device,
   if there is one. The skipped proxy is eligible again after 2 minutes or as soon as a
   link comes up through it, and is listed in the Connection sensor's `avoided_proxies`
-  attribute meanwhile. A device only one proxy can reach keeps using it.
+  attribute meanwhile. A device only one proxy can reach keeps using it. A connection slot
+  the computer's own Bluetooth adapter had reserved for the path that was skipped is handed
+  back at once, so it is never left one slot short.
 
 What that costs, stated plainly:
 

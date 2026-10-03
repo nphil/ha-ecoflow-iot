@@ -489,6 +489,7 @@ class _Rig:
         self.scanners = scanners
         self.chosen: list[_Scanner] = []
         self.attempts = 0
+        self.connect_kwargs: list[dict] = []
         rig = self
 
         class FakeWrapper:
@@ -505,7 +506,8 @@ class _Rig:
             def _async_get_backend_for_ble_device(self, manager, scanner, ble_device):
                 return SimpleNamespace(scanner=scanner, ble_device=ble_device)
 
-            async def connect(self, **_kwargs) -> None:
+            async def connect(self, **kwargs) -> None:
+                rig.connect_kwargs.append(kwargs)
                 backend = self._async_get_best_available_backend_and_device(
                     rig.manager
                 )
@@ -543,6 +545,7 @@ class _LinkDevice:
         self._establish = establish
         self._dropped = asyncio.Event()
         self.connect_calls = 0
+        self.disconnects = 0
 
     def on_packet_parsed(self, _listener):
         return lambda: None
@@ -574,6 +577,7 @@ class _LinkDevice:
         await self._dropped.wait()
 
     async def disconnect(self) -> None:
+        self.disconnects += 1
         self._dropped.set()
 
 
@@ -655,6 +659,12 @@ def test_a_connect_that_stalls_through_the_preferred_proxy_is_retried_through_an
         assert rig.routes == ["near-proxy", "far-proxy"]
         assert device.connect_calls == 1, "the retry happened inside the one pass"
         assert coordinator.link_state == far.name
+        # Each attempt was handed a backend timeout of its own, inside the guard that
+        # would otherwise have to cancel it (startup contract S8).
+        assert rig.connect_kwargs and all(
+            kwargs["timeout"] < coordinator_module.BLE_CONNECT_TIMEOUT
+            for kwargs in rig.connect_kwargs
+        )
 
         await coordinator.async_stop()
 
@@ -681,5 +691,82 @@ def test_a_lone_proxy_is_still_used_after_it_stalled_and_forgiven_once_it_works(
         assert coordinator.link_attributes["avoided_proxies"] == []
 
         await coordinator.async_stop()
+
+    asyncio.run(scenario())
+
+
+# -------------------------------------------------------------------------- S8 ---
+#
+# "Teardown that must complete runs in a cancellation-safe finaliser": cancelling the
+# background task that supervises a link - whatever it is doing at the time - must not
+# abandon an open link. HA cancels an entry's background tasks when it tears the entry
+# down, which for an entry that never reached `async_stop` is the only teardown there is.
+
+
+def test_cancelling_the_supervisor_while_it_connects_releases_the_half_made_link(
+    monkeypatch, stack
+) -> None:
+    async def scenario() -> None:
+        entered = asyncio.Event()
+
+        async def never_answers(_attempt: int) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        _Rig(monkeypatch, [_Scanner("only-proxy", -50)], never_answers)
+        monkeypatch.setattr(coordinator_module, "BLE_SETUP_READY_WAIT", 0.1)
+        device = _LinkDevice(authenticated=[True])
+        coordinator = _routed_coordinator(stack, device, preferred=None)
+        assert await coordinator.async_start() is None
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        supervisor = coordinator._supervisor
+        supervisor.cancel()
+        await asyncio.wait([supervisor])
+
+        assert device.disconnects >= 1, "the link made so far was left open"
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_the_supervisor_while_it_holds_a_healthy_link_releases_it(
+    monkeypatch, stack
+) -> None:
+    """Not through `async_stop`: a task torn down on its own, as HA does to an entry's
+    background tasks when setup is abandoned."""
+
+    async def scenario() -> None:
+        _Rig(monkeypatch, [_Scanner("only-proxy", -50)], _instantly)
+        device = _LinkDevice(authenticated=[True])
+        coordinator = _routed_coordinator(stack, device, preferred=None)
+        assert await coordinator.async_start() is None
+        assert coordinator.connected
+
+        supervisor = coordinator._supervisor
+        supervisor.cancel()
+        await asyncio.wait([supervisor])
+
+        assert device.disconnects == 1, "a healthy link was abandoned open"
+
+    asyncio.run(scenario())
+
+
+def test_the_shutdown_release_stays_with_the_shutdown_job(monkeypatch, stack) -> None:
+    """Once latched for shutdown, `async_release_at_shutdown` releases the link itself,
+    in its own order (cancel the supervisor, then close the device). The supervisor
+    being cancelled in the middle of that must not start a second, earlier teardown."""
+
+    async def scenario() -> None:
+        _Rig(monkeypatch, [_Scanner("only-proxy", -50)], _instantly)
+        device = _LinkDevice(authenticated=[True])
+        coordinator = _routed_coordinator(stack, device, preferred=None)
+        assert await coordinator.async_start() is None
+
+        coordinator.close_for_shutdown()
+        supervisor = coordinator._supervisor
+        supervisor.cancel()
+        await asyncio.wait([supervisor])
+
+        assert device.disconnects == 0
 
     asyncio.run(scenario())

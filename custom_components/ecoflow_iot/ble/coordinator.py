@@ -81,7 +81,7 @@ from ..const import (
 )
 from ..ble_affinity import make_affinity_client_class
 from ..eflib import DeviceBase
-from ..eflib.connection import Connection
+from ..eflib.connection import Connection, backend_timeout_for
 from ..eflib.exceptions import AuthErrors, LinkClosed
 from . import link_health, unreachable
 
@@ -459,7 +459,21 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             connected_at = time.monotonic()
 
             # Healthy and idle: nothing to do until the device goes away.
-            await self.device.wait_disconnected()
+            try:
+                await self.device.wait_disconnected()
+            except asyncio.CancelledError:
+                # Cancelled while holding a healthy link. `async_stop` and the
+                # shutdown job both clear `_hold` before they cancel, and release
+                # the link themselves, in their own order - they are left to it.
+                # What is left is a task torn down on its own, as Home Assistant
+                # does to an entry's background tasks when setup is abandoned:
+                # nothing else then lets go of the link, and one abandoned open is
+                # a ghost on the peripheral. So the teardown finishes before this
+                # task leaves, as `_connect_once`'s does when the cancellation
+                # lands while connecting.
+                if self._hold:
+                    await self._safe_disconnect()
+                raise
 
             lived = time.monotonic() - connected_at
             self._record_drop()
@@ -580,9 +594,11 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         """Build once, lazily, the client class that prefers the configured proxy.
 
         Two layers: the affinity wrapper picks the proxy for each attempt, and
-        the bounded wrapper on top of it caps each attempt at
-        BLE_CONNECT_TIMEOUT and tells `_note_failed_attempt` about every one
-        that stalled or failed, so the retry is routed elsewhere.
+        the bounded wrapper on top of it holds each attempt to
+        BLE_CONNECT_TIMEOUT - handing the backend a shorter timeout of its own
+        first, so a stalled attempt normally ends by the backend's own error path
+        and not by cancellation - and tells `_note_failed_attempt` about every
+        one that stalled or failed, so the retry is routed elsewhere.
 
         The runtime BleakClient is resolved here rather than at module import:
         Home Assistant replaces it with its connection-tracking wrapper during
@@ -599,6 +615,7 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             self._client_class = make_bounded_client_class(
                 affinity,
                 timeout=BLE_CONNECT_TIMEOUT,
+                backend_timeout=backend_timeout_for(BLE_CONNECT_TIMEOUT),
                 on_failure=self._note_failed_attempt,
             )
         return self._client_class

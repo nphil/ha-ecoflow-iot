@@ -370,6 +370,213 @@ def test_the_skip_is_logged_with_its_real_reason() -> None:
         logger.setLevel(previous)
 
 
+# ------------------------------------------------------------ local adapter slots ---
+#
+# habluetooth reserves a connection slot on a *local* adapter the moment it builds a
+# backend for it - long before anything connects - and takes it back only when that
+# backend's connect fails (`HaBleakClientWrapper.connect`) or when the BlueZ device
+# disconnects (`BleakSlotManager`'s watcher). A backend that is built and then
+# discarded gets neither. These fakes keep that accounting; the same scenarios were
+# also run against the installed habluetooth 6.26.11 wrapper and the real
+# `BleakSlotManager` when this was fixed.
+
+
+class SlotAwareRouting:
+    """habluetooth's default routing as it treats local adapters versus proxies.
+
+    Mirrors `HaBleakClientWrapper._async_get_backend_for_ble_device` and
+    `_async_get_best_available_backend_and_device`: a BLEDevice without a
+    ``source`` belongs to a local adapter, and building its backend reserves a slot
+    through `manager.async_allocate_connection_slot` (``None`` when that adapter is
+    full); one with a ``source`` belongs to a proxy, whose backend is built only if
+    its connector can take a connection and reserves nothing. Best RSSI wins.
+    """
+
+    def __init__(self, address: str = ADDRESS) -> None:
+        self._HaBleakClientWrapper__address = address
+
+    def _async_get_backend_for_ble_device(self, manager, scanner, ble_device):
+        source = ble_device.details.get("source")
+        if not source:
+            if not manager.async_allocate_connection_slot(ble_device):
+                return None
+        elif not scanner.connector.can_connect():
+            return None
+        return SimpleNamespace(device=ble_device, scanner=scanner, source=source)
+
+    def _async_get_best_available_backend_and_device(self, manager):
+        address = self._HaBleakClientWrapper__address
+        for entry in sorted(
+            manager.async_scanner_devices_by_address(address, True),
+            key=lambda entry: entry.advertisement.rssi,
+            reverse=True,
+        ):
+            if backend := self._async_get_backend_for_ble_device(
+                manager, entry.scanner, entry.ble_device
+            ):
+                return backend
+        raise RuntimeError("no backend with a free connection slot")
+
+
+class SlotManager:
+    """The scanner devices per address, plus `BleakSlotManager`'s allocate/release."""
+
+    def __init__(self, devices_for, capacity: dict[str, int]) -> None:
+        self._devices_for = devices_for
+        self.capacity = capacity
+        self.reserved: dict[str, set[str]] = {adapter: set() for adapter in capacity}
+
+    def async_scanner_devices_by_address(self, address, connectable):
+        return self._devices_for(address)
+
+    def async_allocate_connection_slot(self, device) -> bool:
+        adapter = device.details["adapter"]
+        if device.address in self.reserved[adapter]:
+            return True
+        if len(self.reserved[adapter]) >= self.capacity[adapter]:
+            return False
+        self.reserved[adapter].add(device.address)
+        return True
+
+    def async_release_connection_slot(self, device) -> None:
+        self.reserved[device.details["adapter"]].discard(device.address)
+
+
+def seen_by(
+    scanner: FakeScanner, rssi: int, *, address: str = ADDRESS, adapter: str | None = None
+) -> FakeScannerDevice:
+    """How `scanner` sees the device: a local adapter's BLEDevice carries no source, a proxy's does."""
+    entry = FakeScannerDevice(scanner)
+    entry.ble_device = SimpleNamespace(
+        address=address,
+        details={"adapter": adapter} if adapter else {"source": scanner.source},
+    )
+    entry.advertisement = SimpleNamespace(rssi=rssi)
+    return entry
+
+
+def failed_last_attempt(*scanners: FakeScanner):
+    """An `is_penalised` hook that reports these scanners as having just failed."""
+    return lambda scanner: (
+        link_health.FAILED_ATTEMPT_REASON if scanner in scanners else False
+    )
+
+
+def local_and_proxy(local_slots: int, **proxy_options):
+    local = FakeScanner("hci0")
+    proxy = FakeScanner("office-proxy", **proxy_options)
+    manager = SlotManager(
+        lambda address: [
+            seen_by(local, -40, address=address, adapter="hci0"),
+            seen_by(proxy, -60, address=address),
+        ],
+        {"hci0": local_slots},
+    )
+    return local, proxy, manager
+
+
+def test_replacing_a_local_default_backend_gives_its_slot_back() -> None:
+    """The local adapter is the default pick, but its last attempt failed, so the
+    proxy is used instead.
+
+    The adapter's slot was reserved when the discarded backend was built. Nothing
+    will ever connect with that backend, and the adapter's BlueZ watcher only acts
+    when a *connected* device disconnects, so unless it is handed back the adapter
+    stays one slot short for every device it serves - and its allocation list, which
+    the Connection sensor reads, names it as holding this device while the link is
+    really on the proxy.
+    """
+    local, proxy, manager = local_and_proxy(local_slots=3)
+    client_class = make_affinity_client_class(
+        SlotAwareRouting, lambda: None, is_penalised=failed_last_attempt(local)
+    )
+
+    backend = client_class()._async_get_best_available_backend_and_device(manager)
+
+    assert backend.scanner is proxy
+    assert manager.reserved["hci0"] == set()
+
+
+def test_a_device_retried_away_from_the_adapter_does_not_use_up_its_last_slot() -> None:
+    """One slot, one device that had to move to a proxy: the next device that is
+    perfectly happy on the adapter must still be able to have it."""
+    local, proxy, manager = local_and_proxy(local_slots=1)
+    retried = make_affinity_client_class(
+        SlotAwareRouting, lambda: None, is_penalised=failed_last_attempt(local)
+    )
+    healthy = make_affinity_client_class(SlotAwareRouting, lambda: None)
+
+    first = retried("AA:BB:CC:DD:EE:01")
+    assert first._async_get_best_available_backend_and_device(manager).scanner is proxy
+    second = healthy("AA:BB:CC:DD:EE:02")
+    assert second._async_get_best_available_backend_and_device(manager).scanner is local
+
+
+def test_a_penalised_default_with_nothing_to_replace_it_keeps_its_slot() -> None:
+    """Steering away must never strand a device: when no other path can take it, the
+    penalised local default is used after all, and the slot it holds is its own."""
+    local, _proxy, manager = local_and_proxy(local_slots=3, connectable=False)
+    client_class = make_affinity_client_class(
+        SlotAwareRouting, lambda: None, is_penalised=failed_last_attempt(local)
+    )
+
+    backend = client_class()._async_get_best_available_backend_and_device(manager)
+
+    assert backend.scanner is local
+    assert manager.reserved["hci0"] == {ADDRESS}
+
+
+def test_a_replacement_that_cannot_be_built_leaves_the_default_its_slot() -> None:
+    """The replacement looked usable, but its own adapter turns out to be full: the
+    default stays in use, so the slot reserved for it must not have been given away."""
+    first, second = FakeScanner("hci0"), FakeScanner("hci1")
+    manager = SlotManager(
+        lambda address: [
+            seen_by(first, -40, address=address, adapter="hci0"),
+            seen_by(second, -60, address=address, adapter="hci1"),
+        ],
+        {"hci0": 3, "hci1": 0},
+    )
+    client_class = make_affinity_client_class(
+        SlotAwareRouting, lambda: None, is_penalised=failed_last_attempt(first)
+    )
+
+    backend = client_class()._async_get_best_available_backend_and_device(manager)
+
+    assert backend.scanner is first
+    assert manager.reserved["hci0"] == {ADDRESS}
+
+
+def test_routing_survives_a_slot_release_that_cannot_be_done() -> None:
+    """Handing a slot back is housekeeping: whatever the manager does, the connect
+    still goes through the replacement."""
+
+    class Raises(SlotManager):
+        def async_release_connection_slot(self, device) -> None:
+            raise RuntimeError("the slot manager is gone")
+
+    class Lacks(SlotManager):
+        async_release_connection_slot = None  # a habluetooth without the method
+
+    for manager_class in (Raises, Lacks):
+        local = FakeScanner("hci0")
+        proxy = FakeScanner("office-proxy")
+        manager = manager_class(
+            lambda address: [
+                seen_by(local, -40, address=address, adapter="hci0"),
+                seen_by(proxy, -60, address=address),
+            ],
+            {"hci0": 3},
+        )
+        client_class = make_affinity_client_class(
+            SlotAwareRouting, lambda: None, is_penalised=failed_last_attempt(local)
+        )
+
+        backend = client_class()._async_get_best_available_backend_and_device(manager)
+
+        assert backend.scanner is proxy, manager_class.__name__
+
+
 def main() -> None:
     tests = (
         test_preferred_scanner_present_and_connectable_is_chosen,
@@ -379,6 +586,11 @@ def main() -> None:
         test_preferred_proxy_gets_one_half_open_trial_after_its_cooldown,
         test_a_failed_attempt_steers_the_next_one_to_another_proxy_for_a_while,
         test_the_skip_is_logged_with_its_real_reason,
+        test_replacing_a_local_default_backend_gives_its_slot_back,
+        test_a_device_retried_away_from_the_adapter_does_not_use_up_its_last_slot,
+        test_a_penalised_default_with_nothing_to_replace_it_keeps_its_slot,
+        test_a_replacement_that_cannot_be_built_leaves_the_default_its_slot,
+        test_routing_survives_a_slot_release_that_cannot_be_done,
     )
     for test in tests:
         test()
