@@ -456,7 +456,7 @@ class Connection:
             # Clear any ghost connection BlueZ is still holding for this device (e.g.
             # left over from a bad disconnect); otherwise new connection attempts can be
             # refused until the adapter is reset.
-            await close_stale_connections_by_address(self.ble_dev().address)
+            await self._close_stale_connections()
             # max_attempts=0 means unlimited at Connection level, but
             # establish_connection needs a real retry count for BLE-level attempts (e.g.
             # when adapter slots are contested).
@@ -471,10 +471,14 @@ class Connection:
             # bleak_retry_connector's own retry loop calls the real
             # `client.connect()` with its own hardcoded 20s timeout regardless, so
             # BLE_CONNECT_TIMEOUT never actually bounded a connect attempt. This
-            # `asyncio.timeout` is what does that now: the whole call - every
-            # internal attempt bleak_retry_connector makes - is capped at
-            # `Options.timeout * ble_attempts` instead of being able to run for
-            # bleak_retry_connector's own safety timeout (60s) per attempt.
+            # `asyncio.timeout` caps the whole call - every internal attempt
+            # bleak_retry_connector makes - at `Options.timeout * ble_attempts`
+            # instead of letting it run for bleak_retry_connector's own safety
+            # timeout (60s) per attempt. That is only the total, though: one
+            # stalled first attempt would still eat all of it and the retry would
+            # never start. Capping each *attempt* is the client class's job - the
+            # coordinator passes one built by `ble.bounded_client` - because it is
+            # also what knows which proxy carried the attempt.
             async with asyncio.timeout(self._options.timeout * ble_attempts):
                 self._client = await establish_connection(
                     client_class,
@@ -546,13 +550,20 @@ class Connection:
         self._inbox = asyncio.Queue()
 
         try:
-            await self._start_notify(self._on_notification)
+            # Bounded like every other radio step: through an ESPHome proxy the
+            # subscribe is a GATT round trip the proxy can leave unanswered, and the
+            # stack's own timeout for it is far longer than a healthy link needs
+            # (live 2026-10-02: 20 s, then GATT error 133). Unbounded, the whole link
+            # waits that out before the retry even gets started.
+            async with asyncio.timeout(self._options.timeout):
+                await self._start_notify(self._on_notification)
         except Exception as e:  # noqa: BLE001 - any subscribe failure is fatal here
             # BlueZ can raise synchronously from start_notify (e.g. "Remote peer
             # disconnected") without bleak firing its disconnected callback, so drive
             # the reconnect ourselves.
             self._logger.warning(
-                "Failed to subscribe to notifications (%s); reconnecting", e
+                "Failed to subscribe to notifications (%s); reconnecting",
+                str(e) or f"no answer within {self._options.timeout:g}s",
             )
             await self._disconnect_client()
             self.disconnected()
@@ -561,6 +572,17 @@ class Connection:
         if self._auth_task is not None and not self._auth_task.done():
             self._auth_task.cancel()
         self._auth_task = self._add_task(self._run_auth())
+
+    async def _close_stale_connections(self) -> None:
+        """Best-effort BlueZ housekeeping that must not be able to hold up a connect"""
+        try:
+            async with asyncio.timeout(self._options.timeout):
+                await close_stale_connections_by_address(self.ble_dev().address)
+        except TimeoutError:
+            self._logger.warning(
+                "Clearing stale connections took longer than %ss; connecting anyway",
+                self._options.timeout,
+            )
 
     def disconnected(self, *args, **kwargs) -> None:
         # Traces the trigger: an unsolicited bleak drop shows bleak/asyncio frames here,
@@ -789,19 +811,27 @@ class Connection:
         if self._closing:
             return
         try:
+            # Every stage gets `Options.timeout` for its write *and* its reply. The
+            # reply reads were always bounded; the writes were not, and through an
+            # ESPHome proxy a GATT write it never answers (retried four times by
+            # `send_request`) used to hold the handshake for as long as the stack's
+            # own timeouts allowed - the caller's overall cap was all that ended it.
             match self._encrypt_type:
                 case 0:
-                    await self._type_0_session()
+                    async with asyncio.timeout(self._options.timeout):
+                        await self._type_0_session()
                 case 1:
-                    await self._type_1_session()
+                    async with asyncio.timeout(self._options.timeout):
+                        await self._type_1_session()
                 case _:
                     await self._init_ble_session_key()
 
             # What confirms the link is the auth reply, or the first data packet
             self._start_data_pump()
 
-            await self._auto_authentication()
-            await self._wait_authenticated()
+            async with asyncio.timeout(self._options.timeout):
+                await self._auto_authentication()
+                await self._wait_authenticated()
         except TimeoutError as e:
             await self._auth_failed(ConnectionState.ERROR_TIMEOUT, e, client)
         except Exception as e:  # noqa: BLE001 - any auth stage failure ends the session
@@ -995,9 +1025,19 @@ class Connection:
             return
         self._logger.warning("Clearing GATT cache to force service re-discovery")
         try:
-            await clear_cache()
+            # A round trip to the proxy like any other, so held to the same step
+            # budget: it runs on the failure path of a connect, where waiting out
+            # the stack's own (much longer) timeout would delay the retry it exists
+            # to unblock.
+            async with asyncio.timeout(self._options.timeout):
+                await clear_cache()
         except BleakError as e:
             self._logger.warning("Failed to clear GATT cache: %s", e)
+        except TimeoutError:
+            self._logger.warning(
+                "Clearing the GATT cache took longer than %ss; continuing",
+                self._options.timeout,
+            )
 
     async def _gen_session_key(self, seed: bytes, srand: bytes):
         """Implements the necessary part of the logic, rest is skipped"""
@@ -1060,14 +1100,20 @@ class Connection:
 
     @contextlib.asynccontextmanager
     async def _expecting_response(self):
-        """The stage inside this block owns the inbox"""
+        """The stage inside this block owns the inbox, and has `Options.timeout` to finish
+
+        That budget covers everything the block does - the request write as well as
+        the wait for the reply - so a stage that stalls anywhere ends as a
+        `TimeoutError`, which `_run_auth` turns into a failed handshake.
+        """
         # The pump owns the inbox once the handshake is done, so this is a bug here
         if self._data_pump is not None:
             raise RuntimeError("the data pump already owns the inbox")
 
         self._stage_reading = True
         try:
-            yield
+            async with asyncio.timeout(self._options.timeout):
+                yield
         finally:
             self._stage_reading = False
 

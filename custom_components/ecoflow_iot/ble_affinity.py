@@ -40,12 +40,19 @@ Two failure modes the caller's own failure counter cannot see:
   connect (`BaseHaScanner._finished_connecting`), so a proxy that accepts the
   connection and then loses it seconds later - a marginal RF path, not a
   connect failure - always shows `failures == 0` and keeps winning forever,
-  whether it is the preferred proxy or just the strongest RSSI. `is_penalised`
-  is an injected predicate over a scanner; the caller is expected to back it
-  with its own per-(address, scanner source) short-link history (see
-  `ble/link_health.py` in this integration) and clear it on a link that
-  actually holds. A penalised scanner is skipped exactly like one whose
-  failure count is at `max_failures`, including as the *default* pick: if
+  whether it is the preferred proxy or just the strongest RSSI. The same blind
+  spot hides an attempt that connected and then stalled (a notification
+  subscribe that never answered): to habluetooth that is a success too, so the
+  preferred proxy would be chosen straight away again. `is_penalised` is an
+  injected predicate over a scanner; the caller is expected to back it with
+  its own per-(address, scanner source) history (see `ble/link_health.py` in
+  this integration) of short links and of stalled or failed attempts, and
+  clear it on a link that actually holds. It may return a short reason
+  instead of `True` ("has dropped this link too soon...", "stalled or failed
+  its last connection attempt..."); that completes the "preferred proxy
+  <name> ..." log lines, and any other truthy value reads as the short-link
+  wording. A penalised scanner is skipped exactly like one whose failure
+  count is at `max_failures`, including as the *default* pick: if
   habluetooth's own scorer would have chosen a penalised scanner, the best
   non-penalised connectable alternative is used instead, and default routing
   only runs unmodified when none exists.
@@ -97,6 +104,10 @@ DEFAULT_MAX_FAILURES = 3
 DEFAULT_HALF_OPEN_COOLDOWN = 600.0  # 10 minutes
 DEFAULT_HALF_OPEN_MAX_COOLDOWN = 3600.0  # 1 hour
 
+# What a bare `True` from `is_penalised` is logged as; a caller that knows better
+# returns its own reason string (see `make_affinity_client_class`).
+_DEFAULT_PENALTY_REASON = "has dropped this link too soon too often recently"
+
 _SELECT = "_async_get_best_available_backend_and_device"
 _BACKEND_FOR = "_async_get_backend_for_ble_device"
 # HaBleakClientWrapper skips BleakClient.__init__ and keeps the address in a
@@ -137,7 +148,9 @@ def _is_connectable(scanner: Any) -> bool:
     return connector is not None and connector.can_connect()
 
 
-def _best_available(scanner_devices: Any, is_penalised: Callable[[Any], bool]) -> Any:
+def _best_available(
+    scanner_devices: Any, is_penalised: Callable[[Any], bool | str]
+) -> Any:
     """Best-RSSI connectable, non-penalised scanner device, or ``None``."""
     candidates = [
         device
@@ -155,7 +168,7 @@ def make_affinity_client_class(
     *,
     max_failures: int = DEFAULT_MAX_FAILURES,
     on_choice: Callable[[str, bool], None] | None = None,
-    is_penalised: Callable[[Any], bool] | None = None,
+    is_penalised: Callable[[Any], bool | str] | None = None,
     on_suspension_change: Callable[[str, bool], None] | None = None,
     half_open_cooldown: float = DEFAULT_HALF_OPEN_COOLDOWN,
     half_open_max_cooldown: float = DEFAULT_HALF_OPEN_MAX_COOLDOWN,
@@ -167,8 +180,11 @@ def make_affinity_client_class(
     takes effect on the next reconnect without rebuilding the client.
     ``on_choice(scanner_name, preferred_used)`` is invoked after every
     selection so the caller can surface which path was taken.
-    ``is_penalised(scanner)`` reports whether a scanner has recently accepted
-    connections it could not hold; it defaults to "never" when omitted.
+    ``is_penalised(scanner)`` reports whether a scanner should be skipped
+    because it recently accepted connections it could not hold, or an attempt
+    through it stalled or failed; it defaults to "never" when omitted. It may
+    return a short reason (completing "preferred proxy <name> ...") rather
+    than ``True``, which is logged as the short-link wording.
     ``on_suspension_change(scanner_name, suspended)`` fires once on each
     transition into or out of skipping the preferred scanner (for either
     reason), so the caller can surface it as a diagnostic without polling.
@@ -262,11 +278,13 @@ def make_affinity_client_class(
                     break
 
                 key = (address, scanner.source)
-                if is_penalised(scanner):
+                if penalty := is_penalised(scanner):
                     _suspend(
                         key,
                         scanner,
-                        "has dropped this link too soon too often recently",
+                        penalty
+                        if isinstance(penalty, str)
+                        else _DEFAULT_PENALTY_REASON,
                     )
                     break
 
@@ -310,9 +328,10 @@ def make_affinity_client_class(
 
         default_backend = default_select(self, manager)
         default_scanner = getattr(default_backend, "scanner", None)
-        if default_scanner is not None and is_penalised(default_scanner):
-            # habluetooth's own scorer has no memory of short links, so left
-            # unmodified it re-picks the same bad proxy every time.
+        if default_scanner is not None and (penalty := is_penalised(default_scanner)):
+            # habluetooth's own scorer has no memory of short links, or of an
+            # attempt that connected and then stalled, so left unmodified it
+            # re-picks the same bad proxy every time.
             alt = _best_available(scanner_devices, is_penalised)
             if alt is not None:
                 backend = getattr(self, _BACKEND_FOR)(
@@ -320,10 +339,12 @@ def make_affinity_client_class(
                 )
                 if backend is not None:
                     _LOGGER.info(
-                        "%s: default routing chose %s, which has dropped this "
-                        "link too soon too often recently; using %s instead",
+                        "%s: default routing chose %s, which %s; using %s instead",
                         address,
                         getattr(default_scanner, "name", "?"),
+                        penalty
+                        if isinstance(penalty, str)
+                        else _DEFAULT_PENALTY_REASON,
                         alt.scanner.name,
                     )
                     if on_choice is not None:

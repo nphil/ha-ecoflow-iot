@@ -66,6 +66,7 @@ type EcoFlowConfigEntry = ConfigEntry[EcoFlowCoordinator]
 
 async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> bool:
     """Set up EcoFlow IoT from a config entry."""
+    started = hass.loop.time()
     _async_register_services(hass)
     if is_ble_entry(entry):
         # Loaded through the executor: a cloud-only installation never loads
@@ -73,7 +74,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowConfigEntry) -> b
         # PyCryptodome and protobuf - never blocks the event loop.
         ble = await async_import_module(hass, f"{__package__}.ble")
 
-        return await ble.async_setup_entry(hass, entry)
+        return await ble.async_setup_entry(hass, entry, started=started)
 
     await _async_register_card(hass)
 

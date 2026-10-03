@@ -65,8 +65,23 @@ PLATFORMS: list[Platform] = [
 _REAPPEAR_KEY = f"{DOMAIN}_ble_reappear"
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -> bool:
-    """Set up one EcoFlow device over Bluetooth."""
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: EcoFlowBleConfigEntry,
+    *,
+    started: float | None = None,
+) -> bool:
+    """Set up one EcoFlow device over Bluetooth.
+
+    ``started`` is the loop time at which Home Assistant began setting this entry
+    up (the root `async_setup_entry` takes it before importing this package), so
+    the whole setup - import included - stays inside `BLE_SETUP_READY_WAIT`
+    rather than the wait for the link starting only after the import. Nothing
+    here waits on the radio beyond that budget: the link comes up in the
+    background.
+    """
+    if started is None:
+        started = hass.loop.time()
     if hass.data.get(SHUTDOWN_LATCH_KEY):
         raise _shutting_down()
     # Imported through the executor: a cloud-only installation never pays for
@@ -161,7 +176,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EcoFlowBleConfigEntry) -
         )
     )
 
-    if (auth_error := await coordinator.async_start()) is not None:
+    if (auth_error := await coordinator.async_start(started=started)) is not None:
         await coordinator.async_stop()
         raise ConfigEntryAuthFailed(
             translation_domain=DOMAIN,

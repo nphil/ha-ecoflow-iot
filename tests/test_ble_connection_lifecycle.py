@@ -15,12 +15,14 @@ import logging
 import sys
 import time
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
 
 _ROOT = Path(__file__).resolve().parents[1]
 if "custom_components" not in sys.modules:
@@ -31,6 +33,13 @@ if "custom_components" not in sys.modules:
     _pkg.__path__ = [str(_ROOT / "custom_components" / "ecoflow_iot")]
     sys.modules["custom_components.ecoflow_iot"] = _pkg
     setattr(_cc, "ecoflow_iot", _pkg)
+if "custom_components.ecoflow_iot.ble" not in sys.modules:
+    # Only the Home Assistant-free modules of the `ble` package are used here, so
+    # its (Home Assistant importing) initialiser is stood in for, as in
+    # `test_preferred_proxy.py`.
+    _ble = ModuleType("custom_components.ecoflow_iot.ble")
+    _ble.__path__ = [str(_ROOT / "custom_components" / "ecoflow_iot" / "ble")]
+    sys.modules["custom_components.ecoflow_iot.ble"] = _ble
 
 from custom_components.ecoflow_iot import eflib  # noqa: E402
 from custom_components.ecoflow_iot.eflib import commands as commands_module  # noqa: E402
@@ -39,6 +48,10 @@ from custom_components.ecoflow_iot.eflib.connection import (  # noqa: E402
     Connection,
     ConnectionState,
 )
+from custom_components.ecoflow_iot.ble.bounded_client import (  # noqa: E402
+    make_bounded_client_class,
+)
+from custom_components.ecoflow_iot.eflib.encryption import Type7Encryption  # noqa: E402
 from custom_components.ecoflow_iot.eflib.exceptions import (  # noqa: E402
     ConnectionTimeout,
     LinkClosed,
@@ -445,3 +458,281 @@ def test_close_stops_a_send_retry_that_is_sleeping(monkeypatch) -> None:
         assert attempts["n"] == 1
 
     asyncio.run(scenario())
+
+
+# --------------------------------------- startup contract S4: step bounds ---
+#
+# No single connect / subscribe / handshake step may hang longer than
+# `Connection.Options.timeout`. The stack's own timeouts are far longer than a
+# healthy link needs - live 2026-10-02 a River 2 Pro connected through its
+# preferred ESPHome proxy and then sat 20 s in the notification subscribe before
+# GATT error 133 - and whatever a step does not bound, the whole link waits out
+# before its retry even starts. Every stall below is a fake that never answers,
+# against a deliberately small `Options.timeout`.
+
+_STEP = 0.2
+
+
+async def _never(*_args, **_kwargs) -> None:
+    await asyncio.Event().wait()
+
+
+def _as_the_coordinator_runs_it(conn: Connection, *, timeout: float) -> Connection:
+    """The options `EcoFlowBleCoordinator.configure` applies to every connection.
+
+    Above all that reconnecting is the supervisor's job, not the connection's.
+    """
+    return conn.with_disabled_reconnect(True).with_options(
+        Connection.Options(timeout=timeout)
+    )
+
+
+def test_a_subscribe_that_hangs_fails_fast_and_releases_the_link(
+    monkeypatch, caplog
+) -> None:
+    async def scenario() -> None:
+        client = _FakeBleakClient()
+        client.start_notify = _never
+        _patch_establish(monkeypatch, [], client)
+        conn = _make_connection()
+        _as_the_coordinator_runs_it(conn, timeout=_STEP)
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(conn.connect(max_attempts=2), timeout=3.0)
+        elapsed = time.monotonic() - started
+
+        assert _STEP <= elapsed < 1.0
+        # Released, not left half-open for the next attempt to trip over.
+        assert client.disconnect_calls == 1 and not client.is_connected
+        assert conn._state is ConnectionState.DISCONNECTED
+        assert conn._auth_task is None, "no handshake on a link that cannot notify"
+        assert any(
+            record.levelno == logging.WARNING
+            and "subscribe" in record.getMessage()
+            and f"{_STEP:g}s" in record.getMessage()
+            for record in caplog.records
+        ), "the stall must say what stalled and for how long"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("encrypt_type", [0, 1, 7])
+def test_a_handshake_write_that_never_returns_ends_the_handshake_within_the_step_budget(
+    monkeypatch, encrypt_type
+) -> None:
+    """The reply reads were always bounded; the writes in front of them were not."""
+
+    async def scenario() -> None:
+        client = _FakeBleakClient()
+        client.write_gatt_char = _never
+        _patch_establish(monkeypatch, [], client)
+        conn = _make_connection(encrypt_type=encrypt_type)
+        _as_the_coordinator_runs_it(conn, timeout=_STEP)
+        await conn.connect(max_attempts=2)
+
+        started = time.monotonic()
+        state = await asyncio.wait_for(
+            conn.wait_until_authenticated_or_error(), timeout=3.0
+        )
+
+        assert state is ConnectionState.ERROR_TIMEOUT
+        assert time.monotonic() - started < 1.0
+        assert client.disconnect_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_the_stage_that_sends_the_credentials_is_bounded_too(monkeypatch) -> None:
+    async def scenario() -> None:
+        client = _FakeBleakClient()
+        client.write_gatt_char = _never
+        _patch_establish(monkeypatch, [], client)
+        conn = _make_connection()
+        _as_the_coordinator_runs_it(conn, timeout=_STEP)
+        # Skip the three key-exchange stages (the test above covers a stall in
+        # them); what is under test is the write that carries the credentials.
+        conn._encryption = Type7Encryption(bytes(16), bytes(16))
+        conn._init_ble_session_key = _noop
+        await conn.connect(max_attempts=2)
+
+        started = time.monotonic()
+        state = await asyncio.wait_for(
+            conn.wait_until_authenticated_or_error(), timeout=3.0
+        )
+
+        assert state is ConnectionState.ERROR_TIMEOUT
+        assert time.monotonic() - started < 1.0
+        assert client.disconnect_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_a_stale_connection_cleanup_that_hangs_does_not_hold_up_the_connect(
+    monkeypatch, caplog
+) -> None:
+    async def scenario() -> None:
+        client = _FakeBleakClient()
+        client.write_gatt_char = _never
+
+        async def fake_establish_connection(_client_class, _ble_device, _name, **_kw):
+            return client
+
+        monkeypatch.setattr(
+            connection_module, "establish_connection", fake_establish_connection
+        )
+        monkeypatch.setattr(
+            connection_module, "close_stale_connections_by_address", _never
+        )
+        conn = _make_connection()
+        _as_the_coordinator_runs_it(conn, timeout=_STEP)
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(conn.connect(max_attempts=2), timeout=3.0)
+        elapsed = time.monotonic() - started
+
+        assert _STEP <= elapsed < 1.0
+        assert conn.is_connected, "best-effort housekeeping, so it connects anyway"
+        assert any("stale" in record.getMessage() for record in caplog.records)
+        await conn.disconnect()
+
+    asyncio.run(scenario())
+
+
+def test_a_gatt_cache_clear_that_hangs_does_not_hold_up_the_failed_connect(
+    monkeypatch, caplog
+) -> None:
+    """An empty service table makes a connect wipe the cache - one more round trip
+    to the proxy, on the very path that exists to unblock the retry."""
+
+    async def scenario() -> None:
+        client = _FakeBleakClient()
+        client.services = SimpleNamespace(
+            get_characteristic=lambda _uuid: None, characteristics={}
+        )
+        client.clear_cache = _never
+        _patch_establish(monkeypatch, [], client)
+        conn = _make_connection()
+        _as_the_coordinator_runs_it(conn, timeout=_STEP)
+
+        started = time.monotonic()
+        with caplog.at_level(logging.WARNING):
+            await asyncio.wait_for(conn.connect(max_attempts=2), timeout=3.0)
+        elapsed = time.monotonic() - started
+
+        assert _STEP <= elapsed < 1.0
+        assert conn._state is ConnectionState.DISCONNECTED
+        assert any("GATT cache" in record.getMessage() for record in caplog.records)
+
+    asyncio.run(scenario())
+
+
+def _stalling_client_class(calls: list[int]) -> type:
+    """What `establish_connection` instantiates; its first `connect()` never answers."""
+
+    class FirstConnectStalls(_FakeBleakClient):
+        def __init__(self, _device, disconnected_callback=None, **_kwargs) -> None:
+            super().__init__()
+            self.is_connected = False
+
+        async def connect(self, **_kwargs) -> None:
+            calls.append(len(calls) + 1)
+            if len(calls) == 1:
+                await asyncio.Event().wait()
+            self.is_connected = True
+
+        write_gatt_char = _never
+
+    return FirstConnectStalls
+
+
+def test_a_stalled_connect_attempt_leaves_room_for_the_retry_that_follows(
+    monkeypatch,
+) -> None:
+    """The real `establish_connection`, a fake client whose first attempt hangs.
+
+    `establish_connection` calls `client.connect()` with its own hardcoded 20 s
+    timeout per attempt, so capping only the whole call at `Options.timeout *
+    attempts` lets a stalled first attempt eat all of it: the retry - meant to be
+    a second path - never starts. The per-attempt bound is what lets it.
+    """
+
+    async def scenario() -> None:
+        calls: list[int] = []
+        failures: list[BaseException] = []
+        client_class = make_bounded_client_class(
+            _stalling_client_class(calls), timeout=0.3, on_failure=failures.append
+        )
+        monkeypatch.setattr(
+            connection_module, "close_stale_connections_by_address", _noop
+        )
+        conn = _real_connection(client_class)
+        _as_the_coordinator_runs_it(conn, timeout=1.0)  # whole call: 2 x 1.0 s
+
+        started = time.monotonic()
+        await asyncio.wait_for(conn.connect(max_attempts=2), timeout=5.0)
+        elapsed = time.monotonic() - started
+
+        assert calls == [1, 2], "the retry must actually run"
+        assert [type(failure) for failure in failures] == [TimeoutError]
+        assert conn.is_connected
+        assert elapsed < 1.5, "not the 2 s whole-call cap the stalled attempt burned"
+        await conn.disconnect()
+
+    asyncio.run(scenario())
+
+
+def _real_connection(client_class: type) -> Connection:
+    """A `Connection` over a real `BLEDevice`, so the real `establish_connection` runs."""
+
+    async def data_parse(_packet):
+        return False
+
+    async def packet_parse(_data):
+        return None
+
+    return Connection(
+        ble_dev=BLEDevice(ADDRESS, "EF-R31234", {}),
+        dev_sn="R655TEST00001234",
+        user_id="1234567890",
+        data_parse=data_parse,
+        packet_parse=packet_parse,
+        client_class=client_class,
+    )
+
+
+def test_a_cancelled_attempt_is_not_reported_as_a_failed_one() -> None:
+    """Being let go of (an unload, the pass's own cap) is not the proxy's fault."""
+
+    class Hangs:
+        connect = _never
+
+    async def scenario() -> None:
+        failures: list[BaseException] = []
+        client = make_bounded_client_class(
+            Hangs, timeout=5.0, on_failure=failures.append
+        )()
+        attempt = asyncio.create_task(client.connect())
+        await asyncio.sleep(0.05)
+        attempt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attempt
+        assert failures == []
+
+    asyncio.run(scenario())
+
+
+def test_a_failing_report_never_masks_the_connect_error() -> None:
+    class Refused:
+        async def connect(self, **_kwargs) -> None:
+            raise BleakError("no free slot")
+
+    def broken_report(_error: BaseException) -> None:
+        raise RuntimeError("bookkeeping bug")
+
+    client = make_bounded_client_class(
+        Refused, timeout=1.0, on_failure=broken_report
+    )()
+    with pytest.raises(BleakError, match="no free slot"):
+        asyncio.run(client.connect())

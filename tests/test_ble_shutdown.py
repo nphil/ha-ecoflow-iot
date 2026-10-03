@@ -574,11 +574,11 @@ def test_setup_refuses_when_latched_at_entry_and_after_each_await(
         jobs_at_start: list[int] = []
         original_start = coordinator_module.EcoFlowBleCoordinator.async_start
 
-        async def start_then_latch(self):
+        async def start_then_latch(self, **kwargs):
             # The per-entry job must already exist before the first await that
             # can open a link, or a shutdown landing in it would miss the link.
             jobs_at_start.append(len(_registered_jobs(hass)))
-            result = await original_start(self)
+            result = await original_start(self, **kwargs)
             hass.data[SHUTDOWN_LATCH_KEY] = True
             return result
 

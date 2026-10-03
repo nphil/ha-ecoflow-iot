@@ -11,16 +11,20 @@ Deliberate non-behaviours, each of which cost this house time before:
 * Automatic routing remains the default. When the operator names an ESPHome
   proxy, the affinity wrapper chooses it only while it advertises the device,
   has a free slot, has fewer than three consecutive failures (or has cooled
-  down for one half-open retry since), and has not itself accepted and
-  quickly lost this same link twice in a row recently; otherwise habluetooth's
-  scorer runs, also steered away from a scanner in that last state. See
-  `ble_affinity.py` and `.link_health`. This is prevention for the failure
-  seen live on 2026-09-20: the River 3 Pro ghosted for four hours on
-  nitins-office, then healed through downstairs in a different room - and for
-  the failure seen live on 2026-09-24: a PoE proxy accepted the link and
-  dropped it ~5s later, every time, for hours, because habluetooth clears a
-  scanner's failure count on every successful connect regardless of how long
-  the link then lasted.
+  down for one half-open retry since), has not itself accepted and
+  quickly lost this same link twice in a row recently, and did not stall or
+  fail the last attempt for this device a moment ago; otherwise
+  habluetooth's scorer runs, also steered away from a scanner in either of
+  those last states. See `ble_affinity.py` and `.link_health`. This is
+  prevention for the failure seen live on 2026-09-20: the River 3 Pro ghosted
+  for four hours on nitins-office, then healed through downstairs in a
+  different room - for the failure seen live on 2026-09-24: a PoE proxy
+  accepted the link and dropped it ~5s later, every time, for hours, because
+  habluetooth clears a scanner's failure count on every successful connect
+  regardless of how long the link then lasted - and for the one seen on
+  2026-10-02: a River 2 Pro connected through its preferred proxy and then
+  sat 20 s in the notification subscribe before failing, which that same
+  clearing hides from habluetooth too.
 * A healthy link is never torn down and re-established - not for a command, not
   for a refresh, not on a timer. Teardowns are where ghost ACLs come from.
 * A failed attempt never escalates into a config entry reload. The supervisor
@@ -57,6 +61,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from .backoff import attempt_after_drop as _attempt_after_drop, backoff as _backoff
+from .bounded_client import make_bounded_client_class
 from ..const import (
     BLE_AUTH_TIMEOUT,
     BLE_BACKOFF_SECONDS,
@@ -170,6 +175,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         # Consumed (and cleared) the moment that link's fate - short or
         # stable - is recorded against it.
         self._connect_source: str | None = None
+        # Name of the scanner the attempt in flight (or the last one) was
+        # routed through, told to us by the affinity wrapper at each selection.
+        self._attempt_scanner: str | None = None
 
     # -- state read by entities -------------------------------------------------
 
@@ -234,8 +242,9 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             "preferred_proxy": self._preferred_proxy,
             "via_preferred_proxy": self._via_preferred_proxy,
             "preferred_proxy_suspended": self._preferred_proxy_suspended,
-            # Sources currently skipped for accepting a connection and then
-            # losing it before BLE_STABLE_LINK_SECONDS - see `link_health`.
+            # Sources currently skipped by routing: accepted a connection and
+            # then lost it before BLE_STABLE_LINK_SECONDS, or stalled/failed the
+            # last attempt for this device a moment ago - see `link_health`.
             "avoided_proxies": link_health.penalised_sources(
                 store, self.address, now=time.monotonic()
             ),
@@ -295,14 +304,21 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             self._pending_publish = None
         await self.device.close()
 
-    async def async_start(self) -> Exception | None:
+    async def async_start(self, *, started: float | None = None) -> Exception | None:
         """Start holding the link and wait a bounded time for it to come up.
+
+        The wait is the startup contract's setup budget, `BLE_SETUP_READY_WAIT`,
+        counted from ``started`` - the loop time at which entry setup began, so
+        the work done before this point (importing the Bluetooth stack in the
+        executor) comes out of it - or from now when that is not given.
 
         Returns the authentication error if the device rejected our credentials,
         in which case the supervisor has already stopped and the caller should
         fail setup with :class:`ConfigEntryAuthFailed`. Any other outcome -
-        including the device simply being out of range - returns ``None``: the
-        entry loads and the supervisor keeps trying.
+        including the device simply being out of range, or a connect step
+        stalling - returns ``None``: the entry loads, the entities start
+        unavailable and fill in when the supervisor, which keeps going in the
+        background, brings the link up.
         """
         self._hold = True
         # Frame age is measured from receipt, not from a value changing: a device
@@ -323,12 +339,16 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             eager_start=True,
         )
 
+        budget = BLE_SETUP_READY_WAIT
+        if started is not None:
+            budget = max(0.0, budget - (self.hass.loop.time() - started))
         try:
-            async with asyncio.timeout(BLE_SETUP_READY_WAIT):
+            async with asyncio.timeout(budget):
                 await self._settled.wait()
         except TimeoutError:
             _LOGGER.debug(
-                "%s: no link within %ss of setup; entities start unavailable",
+                "%s: no link within the %ss setup budget; entities start unavailable "
+                "and the link comes up in the background",
                 self.device_name,
                 BLE_SETUP_READY_WAIT,
             )
@@ -415,12 +435,19 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
                 continue
             except Exception as err:  # noqa: BLE001 - every failure just retries
                 attempt += 1
+                # What stalled or failed after the connect itself (the
+                # notification subscribe, the handshake) never reached the
+                # per-attempt wrapper, so it is written off here. One the
+                # wrapper already reported is written off again, harmlessly.
+                via = self._attempt_scanner
+                self._note_failed_attempt(err)
                 _LOGGER.log(
                     logging.INFO if attempt < len(BLE_BACKOFF_SECONDS) else logging.DEBUG,
-                    "%s: connect attempt %s failed: %s",
+                    "%s: connect attempt %s failed%s: %s",
                     self.device_name,
                     attempt,
-                    err,
+                    f" via {via}" if via else "",
+                    str(err) or type(err).__name__,
                 )
                 continue
 
@@ -464,6 +491,10 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         if self._closing:
             raise LinkClosed(self.address)
 
+        # A new pass: the scanner the last one went through says nothing about
+        # this one until the affinity wrapper picks again.
+        self._attempt_scanner = None
+
         ble_device = bluetooth.async_ble_device_from_address(
             self.hass, self.address, connectable=True
         )
@@ -480,12 +511,17 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             # The connect step and the auth handshake get separate budgets: a
             # slow connect used to be able to eat almost all of a single 45s
             # window shared between the two, leaving the handshake seconds
-            # where it needs up to BLE_AUTH_TIMEOUT. `Connection.connect`
-            # itself now bounds the connect step (`establish_connection`) to
-            # BLE_CONNECT_TIMEOUT * BLE_CONNECT_ATTEMPTS; this outer timeout
-            # is deliberately one BLE_CONNECT_TIMEOUT wider than that, not
-            # equal to it - equal would let this one fire first over nothing
-            # but the surrounding overhead (BLE device lookup, affinity
+            # where it needs up to BLE_AUTH_TIMEOUT. Every radio step inside is
+            # also capped at BLE_CONNECT_TIMEOUT on its own: each connect
+            # attempt by the client class's wrapper (`.bounded_client`), the
+            # stale-connection cleanup and the notification subscribe by
+            # `Connection.connect`, each handshake stage by `Connection`.
+            # `Connection.connect` additionally bounds the whole connect step
+            # (`establish_connection`) to BLE_CONNECT_TIMEOUT *
+            # BLE_CONNECT_ATTEMPTS; this outer timeout is the backstop on the
+            # pass and is deliberately one BLE_CONNECT_TIMEOUT wider than that,
+            # not equal to it - equal would let this one fire first over
+            # nothing but the surrounding overhead (BLE device lookup, affinity
             # selection, `close_stale_connections_by_address`, characteristic
             # validation), cancelling a connect that was not actually stuck.
             async with asyncio.timeout(
@@ -543,25 +579,36 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
     def _affinity_client_class(self) -> type:
         """Build once, lazily, the client class that prefers the configured proxy.
 
+        Two layers: the affinity wrapper picks the proxy for each attempt, and
+        the bounded wrapper on top of it caps each attempt at
+        BLE_CONNECT_TIMEOUT and tells `_note_failed_attempt` about every one
+        that stalled or failed, so the retry is routed elsewhere.
+
         The runtime BleakClient is resolved here rather than at module import:
         Home Assistant replaces it with its connection-tracking wrapper during
         Bluetooth startup, and this first runs only for a real connect attempt.
         """
         if self._client_class is None:
-            self._client_class = make_affinity_client_class(
+            affinity = make_affinity_client_class(
                 brc.BleakClient,
                 lambda: self.config_entry.options.get(CONF_PREFERRED_PROXY) or None,
                 on_choice=self._on_preferred_proxy_choice,
                 is_penalised=self._is_scanner_penalised,
                 on_suspension_change=self._on_preferred_proxy_suspension_change,
             )
+            self._client_class = make_bounded_client_class(
+                affinity,
+                timeout=BLE_CONNECT_TIMEOUT,
+                on_failure=self._note_failed_attempt,
+            )
         return self._client_class
 
     def _on_preferred_proxy_choice(
-        self, _scanner_name: str, preferred_used: bool
+        self, scanner_name: str, preferred_used: bool
     ) -> None:
-        """Record whether the most recent connect used the preferred proxy."""
+        """Record the proxy the attempt now starting goes through."""
         self._via_preferred_proxy = preferred_used
+        self._attempt_scanner = scanner_name
 
     def _on_preferred_proxy_suspension_change(
         self, _scanner_name: str, suspended: bool
@@ -569,9 +616,11 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         """Record whether the preferred proxy is currently being skipped."""
         self._preferred_proxy_suspended = suspended
 
-    def _is_scanner_penalised(self, scanner: Any) -> bool:
-        """Whether `scanner` has recently accepted this link and then lost it.
+    def _is_scanner_penalised(self, scanner: Any) -> bool | str:
+        """Why routing should skip `scanner` for this device right now, if it should.
 
+        Either it recently accepted this link and then lost it, or an attempt
+        through it stalled or failed a moment ago (`_note_failed_attempt`).
         Backs `ble_affinity`'s `is_penalised` hook; kept here rather than in
         that Home-Assistant-free module because it is the only piece that
         needs `hass.data`.
@@ -579,9 +628,69 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
         source = getattr(scanner, "source", None)
         if not source:
             return False
-        return link_health.is_penalised(
-            self._link_health_store(), self.address, source, now=time.monotonic()
+        return (
+            link_health.penalty(
+                self._link_health_store(), self.address, source, now=time.monotonic()
+            )
+            or False
         )
+
+    def _note_failed_attempt(self, err: BaseException) -> None:
+        """Keep the proxy this attempt went through out of the next attempt's routing.
+
+        Called for every attempt that stalled or failed before an authenticated
+        link existed: by the per-attempt wrapper for a connect, and by the
+        supervisor for whatever failed after it (the notification subscribe,
+        the handshake). Recording is idempotent, so the two may both report one.
+
+        habluetooth cannot do this itself. It clears a scanner's failure count
+        the moment a connect succeeds, so a proxy that connected and then
+        stalled in the subscribe looks healthy to it - and the preferred-proxy
+        affinity would route straight back to it, as it did on 2026-10-02.
+        Nothing is recorded for an attempt that was never routed, or while the
+        entry is unloading or shutting down: a proxy is not at fault for being
+        let go of. Never raises - it runs inside the supervisor's failure
+        handler, where an exception would end the supervisor and with it every
+        later reconnect.
+        """
+        if self._closing or not self._hold:
+            return
+        name = self._attempt_scanner
+        if not name:
+            return
+        try:
+            source = self._scanner_source_for(name)
+            if source is None:
+                return
+            link_health.record_failed_attempt(
+                self._link_health_store(), self.address, source, now=time.monotonic()
+            )
+        except Exception:  # noqa: BLE001 - bookkeeping must not take the supervisor down
+            _LOGGER.debug(
+                "%s: could not record the failed attempt through %s",
+                self.device_name,
+                name,
+                exc_info=True,
+            )
+            return
+        _LOGGER.debug(
+            "%s: an attempt through %s failed (%s); routing skips it for the next %.0f s",
+            self.device_name,
+            name,
+            str(err) or type(err).__name__,
+            link_health.FAILED_ATTEMPT_AVOID_SECONDS,
+        )
+
+    def _scanner_source_for(self, name: str) -> str | None:
+        """Stable source of the scanner whose display name is `name`, if it is still around."""
+        try:
+            scanners = bluetooth.async_current_scanners(self.hass)
+        except (RuntimeError, KeyError):
+            return None
+        for scanner in scanners:
+            if scanner.name == name:
+                return scanner.source or None
+        return None
 
     def _link_health_store(self) -> dict[str, link_health.AddressLinkHealth]:
         return self.hass.data.setdefault(link_health.STORE_KEY, {})
@@ -796,6 +905,12 @@ class EcoFlowBleCoordinator(DataUpdateCoordinator[None]):
             # The allocation this reads is gone by the time a drop is noticed,
             # so it has to be captured here, at the only moment it exists.
             self._connect_source = self._holding_scanner_source()
+            if self._connect_source:
+                # It carried a whole connect, subscribe and handshake just now:
+                # whatever stalled through it earlier has demonstrably passed.
+                link_health.clear_failed_attempt(
+                    self._link_health_store(), self.address, self._connect_source
+                )
         self.reconcile_unreachable_issue()
         self.async_update_listeners()
 

@@ -58,12 +58,23 @@ DEFAULT_UPDATE_PERIOD: Final = 10
 # whenever the named proxy is offline, full or has failed repeatedly.
 CONF_PREFERRED_PROXY: Final = "preferred_proxy"
 DEFAULT_PREFERRED_PROXY: Final = ""
-# Cap on a single BLE connect attempt. Kept short on purpose: habluetooth's
-# connect-failure penalty is sticky, so a long blind attempt through the nearest
-# proxy is worse than failing fast and letting the next attempt be re-scored.
+# Cap on any single radio step of bringing a link up: one connect attempt, the
+# notification subscribe, and each stage of the auth handshake (its request write
+# as well as the reply it waits for). Nothing in that sequence may hang longer
+# than this, because the stack's own timeouts are far longer than a healthy link
+# needs - bleak_retry_connector hardcodes 20 s per connect attempt, and live
+# 2026-10-02 a River 2 Pro's subscribe through an ESPHome proxy sat 20 s before
+# failing. Kept short on purpose: habluetooth's connect-failure penalty is sticky,
+# so a long blind attempt through the nearest proxy is worse than failing fast and
+# letting the next attempt be re-scored - or, with a preferred proxy, steered to a
+# different one (`ble/link_health.py`).
 BLE_CONNECT_TIMEOUT: Final = 10.0
 # BLE attempts inside one supervisor pass. Home Assistant re-picks the proxy for
-# each of them, so a second attempt is a genuine second path, not a repeat.
+# each of them, and a proxy whose attempt just stalled or failed is skipped for the
+# next one (the affinity wrapper's `is_penalised` hook, backed by
+# `ble/link_health.py`), so a second attempt is a genuine second path - also when a
+# preferred proxy is configured, which would otherwise be chosen again until it
+# had failed three times.
 BLE_CONNECT_ATTEMPTS: Final = 2
 # Handshake budget, measured from 'Connected' rather than shared with the
 # connect step: sharing one 45s window between an unbounded connect and the
@@ -71,12 +82,18 @@ BLE_CONNECT_ATTEMPTS: Final = 2
 # per-attempt timeout is 20s, unrelated to BLE_CONNECT_TIMEOUT - see
 # `eflib.connection.Connection.connect`) starve the handshake of the time it
 # needs. Each of the three stages is itself bounded by BLE_CONNECT_TIMEOUT
-# (`Connection.Options.timeout`), so 3x covers the whole sequence once.
+# (`Connection.Options.timeout`, write and reply together), so 3x covers the
+# whole sequence once and this is the outer cap, not what keeps a stalled stage
+# short.
 BLE_AUTH_TIMEOUT: Final = 3 * BLE_CONNECT_TIMEOUT
-# How long entry setup waits for the first authenticated link before returning.
-# It never fails the entry - the supervisor keeps trying - it only decides how
-# long Home Assistant's startup is held for entities that would come up populated.
-BLE_SETUP_READY_WAIT: Final = 20.0
+# Startup contract S1: how long entry setup waits for the first authenticated link
+# before returning, counted from the moment setup began. Home Assistant reports
+# itself started only after every integration's setup returns, so this is time
+# added to every restart. It never fails the entry: the supervisor keeps
+# connecting in the background and the entities (unavailable until then) fill in
+# when the link arrives. All it buys is that a link that comes up quickly is
+# already there when the entities are created.
+BLE_SETUP_READY_WAIT: Final = 5.0
 # Reconnect backoff, in seconds, held at the last step forever. Retrying is never
 # abandoned: a power station out of range for a day must come back on its own.
 BLE_BACKOFF_SECONDS: Final = (1.0, 2.0, 5.0, 10.0, 30.0, 60.0)

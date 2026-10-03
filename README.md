@@ -455,6 +455,24 @@ finding a dashboard full of settings.
   freshly resolved device and lets it score the adapters and proxies itself.
 - If the device is not being heard at setup, the entry stays *not ready* and retries as
   soon as the next advertisement arrives, rather than polling for it.
+- **Setup never waits on the radio.** Home Assistant reports itself started only after
+  every integration's setup has returned, so each Bluetooth entry waits **at most 5
+  seconds** for its first link (counted from when its setup began) and then loads
+  regardless. Its entities are **unavailable** until the link is up — nothing is made up
+  in the meantime — and fill in the moment it is. A value that only exists once the device
+  reports it (the second USB-C port on a River 3 Plus) gets its entity then. Connecting
+  carries on in the background, and bringing the link up never writes anything to the
+  device.
+- **No connecting step waits longer than 10 seconds.** One connect attempt, the
+  notification subscribe and each stage of the handshake are each capped at 10 s, because
+  the Bluetooth stack's own timeouts are much longer — a proxy that accepted the link and
+  then never answered the subscribe used to hold it up for 20 s.
+- **A stalled attempt moves on to a different proxy.** When an attempt through one proxy
+  stalls or fails, the next one — the retry inside the same pass included, and also when
+  you have chosen a preferred proxy — goes through another proxy that can hear the device,
+  if there is one. The skipped proxy is eligible again after 2 minutes or as soon as a
+  link comes up through it, and is listed in the Connection sensor's `avoided_proxies`
+  attribute meanwhile. A device only one proxy can reach keeps using it.
 
 What that costs, stated plainly:
 

@@ -5,7 +5,7 @@ the backing ``dict`` explicitly (the caller passes ``hass.data[STORE_KEY]``)
 rather than a `HomeAssistant` instance, so the decisions that decide whether a
 bad proxy keeps winning are unit-testable without Home Assistant installed.
 
-Two related but distinct records live here, both keyed by Bluetooth address so
+Three related but distinct records live here, all keyed by Bluetooth address so
 a reload - manual, options-triggered, or the household autoheal's five-minute
 sweep - never resets them:
 
@@ -19,6 +19,14 @@ sweep - never resets them:
   it before ``BLE_STABLE_LINK_SECONDS`` - the failure mode habluetooth's own
   connect-failure counter cannot see, because it clears that counter on every
   *successful* connect regardless of how long the link then lasted.
+* Per-(address, scanner source) failed attempts: a connect, subscribe or
+  handshake through that scanner that stalled or failed before any
+  authenticated link existed. They steer the *next* attempt - the second try
+  inside the same connect pass included - to a different scanner, briefly
+  (``FAILED_ATTEMPT_AVOID_SECONDS``). habluetooth cannot see these either: it
+  clears a scanner's failure count the moment a connect succeeds, so a link
+  that connected and then stalled in the notification subscribe looks like a
+  success to it, and the preferred-proxy affinity keeps routing straight back.
 """
 
 from __future__ import annotations
@@ -38,6 +46,19 @@ SHORT_LINK_PENALTY_THRESHOLD = 2
 # may well have cleared up, and nothing else here ever un-sticks it other than
 # a stable link through that same source.
 SHORT_LINK_DECAY_SECONDS = 1800.0
+# An attempt that stalled or failed through a scanner before any authenticated
+# link existed (a connect that never answered, a notification subscribe that
+# hung, a handshake stage that timed out) keeps that scanner out of the routing
+# for the next attempts for this long. Deliberately short: a stall is as likely a
+# busy proxy as a broken one, and the proxy beside the device is where this house
+# wants it to live, so it must be eligible again soon. The long penalty above is
+# for a scanner that has proved itself bad twice over.
+FAILED_ATTEMPT_AVOID_SECONDS = 120.0
+
+# Why a scanner is being skipped, worded to complete "preferred proxy <name> ..."
+# in the affinity wrapper's log lines.
+SHORT_LINK_REASON = "has dropped this link too soon too often recently"
+FAILED_ATTEMPT_REASON = "stalled or failed its last connection attempt for this device"
 
 # hass.data key for the address -> AddressLinkHealth store.
 STORE_KEY = f"{DOMAIN}_ble_link_health"
@@ -58,6 +79,9 @@ class AddressLinkHealth:
     #: scanner source -> (consecutive short-link count, monotonic time of the
     #: most recent one).
     penalties: dict[str, tuple[int, float]] = field(default_factory=dict)
+    #: scanner source -> monotonic time of the most recent attempt through it that
+    #: stalled or failed before an authenticated link existed.
+    failed_attempts: dict[str, float] = field(default_factory=dict)
 
 
 def get(store: dict[str, AddressLinkHealth], address: str) -> AddressLinkHealth:
@@ -123,29 +147,79 @@ def record_stable_link(
     record.penalties.pop(source, None)
 
 
+# -- per-source failed attempts (next-attempt proxy avoidance) ---------------
+
+
+def record_failed_attempt(
+    store: dict[str, AddressLinkHealth], address: str, source: str, *, now: float
+) -> None:
+    """An attempt for `address` through `source` stalled or failed."""
+    get(store, address).failed_attempts[source] = now
+
+
+def clear_failed_attempt(
+    store: dict[str, AddressLinkHealth], address: str, source: str
+) -> None:
+    """An authenticated link came up through `source` - it works, stop skipping it."""
+    record = store.get(address)
+    if record is None:
+        return
+    record.failed_attempts.pop(source, None)
+
+
+# -- the routing verdict -----------------------------------------------------
+
+
+def penalty(
+    store: dict[str, AddressLinkHealth], address: str, source: str, *, now: float
+) -> str | None:
+    """Why routing should skip `source` for `address` right now, or ``None``.
+
+    The wording completes "preferred proxy <name> ..." in `ble_affinity`'s logs.
+    """
+    record = store.get(address)
+    if record is None:
+        return None
+    count, last = record.penalties.get(source, (0, 0.0))
+    if (
+        count >= SHORT_LINK_PENALTY_THRESHOLD
+        and (now - last) <= SHORT_LINK_DECAY_SECONDS
+    ):
+        return SHORT_LINK_REASON
+    failed_at = record.failed_attempts.get(source)
+    if failed_at is not None and (now - failed_at) <= FAILED_ATTEMPT_AVOID_SECONDS:
+        return FAILED_ATTEMPT_REASON
+    return None
+
+
 def is_penalised(
     store: dict[str, AddressLinkHealth], address: str, source: str, *, now: float
 ) -> bool:
-    """Whether `source` has dropped `address`'s link too soon, too often, recently."""
-    record = store.get(address)
-    if record is None:
-        return False
-    count, last = record.penalties.get(source, (0, 0.0))
-    return (
-        count >= SHORT_LINK_PENALTY_THRESHOLD
-        and (now - last) <= SHORT_LINK_DECAY_SECONDS
-    )
+    """Whether routing should skip `source` for `address` right now.
+
+    True if it dropped this link too soon, too often, recently - or if its last
+    attempt for this device stalled or failed a moment ago.
+    """
+    return penalty(store, address, source, now=now) is not None
 
 
 def penalised_sources(
     store: dict[str, AddressLinkHealth], address: str, *, now: float
 ) -> list[str]:
-    """Sources currently penalised for `address`, for a diagnostic attribute."""
+    """Sources routing is currently skipping for `address`, for a diagnostic attribute."""
     record = store.get(address)
     if record is None:
         return []
     return sorted(
-        source
-        for source, (count, last) in record.penalties.items()
-        if count >= SHORT_LINK_PENALTY_THRESHOLD and (now - last) <= SHORT_LINK_DECAY_SECONDS
+        {
+            source
+            for source, (count, last) in record.penalties.items()
+            if count >= SHORT_LINK_PENALTY_THRESHOLD
+            and (now - last) <= SHORT_LINK_DECAY_SECONDS
+        }
+        | {
+            source
+            for source, failed_at in record.failed_attempts.items()
+            if (now - failed_at) <= FAILED_ATTEMPT_AVOID_SECONDS
+        }
     )

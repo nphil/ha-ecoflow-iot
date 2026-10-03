@@ -1,5 +1,6 @@
 """Plain-script proof of the EcoFlow preferred-proxy affinity contract."""
 
+import logging
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
@@ -281,6 +282,94 @@ def test_preferred_proxy_gets_one_half_open_trial_after_its_cooldown() -> None:
     assert select_once().scanner is scanner
 
 
+def _two_proxies() -> tuple[FakeScanner, FakeScanner, list[FakeScannerDevice]]:
+    near = FakeScanner(PREFERRED)
+    far = FakeScanner("master-bedroom-bluetooth-proxy")
+    near_device, far_device = FakeScannerDevice(near), FakeScannerDevice(far)
+    near_device.advertisement = SimpleNamespace(rssi=-45)
+    far_device.advertisement = SimpleNamespace(rssi=-70)
+    return near, far, [near_device, far_device]
+
+
+def test_a_failed_attempt_steers_the_next_one_to_another_proxy_for_a_while() -> None:
+    """An attempt that connected and then stalled (a notification subscribe that
+    never answered) is a *success* to habluetooth, which clears the scanner's
+    failure count at once - so the preferred proxy, healthy by its books, would
+    be chosen again straight away. The caller's own record of the failed
+    attempt is what sends the next one elsewhere, and what forgives it again.
+    """
+    near, far, devices = _two_proxies()
+    store: dict = {}
+    now = [1000.0]
+
+    def penalty(scanner: FakeScanner) -> str | bool:
+        return link_health.penalty(store, ADDRESS, scanner.source, now=now[0]) or False
+
+    client_class = make_affinity_client_class(
+        DefaultRoutingBase, lambda: PREFERRED, is_penalised=penalty
+    )
+
+    def select_once(scanner_devices=devices) -> SimpleNamespace:
+        return client_class()._async_get_best_available_backend_and_device(
+            FakeManager(scanner_devices)
+        )
+
+    assert select_once().scanner is near
+
+    link_health.record_failed_attempt(store, ADDRESS, near.source, now=now[0])
+    assert select_once().scanner is far, "preferred, free and healthy - but it just stalled"
+    assert link_health.penalised_sources(store, ADDRESS, now=now[0]) == [near.source]
+
+    # A moment later it is eligible again: the penalty is for the next
+    # attempts, not a verdict on the proxy beside the device.
+    now[0] += link_health.FAILED_ATTEMPT_AVOID_SECONDS + 1
+    assert select_once().scanner is near
+    assert link_health.penalised_sources(store, ADDRESS, now=now[0]) == []
+
+    # A link that came up through it clears the record at once.
+    link_health.record_failed_attempt(store, ADDRESS, near.source, now=now[0])
+    link_health.clear_failed_attempt(store, ADDRESS, near.source)
+    assert select_once().scanner is near
+
+    # With nowhere else to go it is still used, never skipped into a dead end.
+    link_health.record_failed_attempt(store, ADDRESS, near.source, now=now[0])
+    assert select_once([devices[0]]).scanner is near
+
+
+def test_the_skip_is_logged_with_its_real_reason() -> None:
+    near, _far, devices = _two_proxies()
+    records: list[str] = []
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record.getMessage())
+
+    handler = Capture(level=logging.INFO)
+    logger = logging.getLogger("custom_components.ecoflow_iot.ble_affinity")
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        for reason, wording in (
+            (link_health.FAILED_ATTEMPT_REASON, "stalled or failed its last"),
+            (True, "has dropped this link too soon too often recently"),
+        ):
+            records.clear()
+            client_class = make_affinity_client_class(
+                DefaultRoutingBase, lambda: PREFERRED, is_penalised=lambda s, r=reason: r if s is near else False
+            )
+            client_class()._async_get_best_available_backend_and_device(
+                FakeManager(devices)
+            )
+            assert any(
+                "preferred proxy" in message and wording in message
+                for message in records
+            ), (reason, records)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+
 def main() -> None:
     tests = (
         test_preferred_scanner_present_and_connectable_is_chosen,
@@ -288,6 +377,8 @@ def main() -> None:
         test_preferred_scanner_after_three_failures_uses_default_selection,
         test_short_lived_links_steer_default_routing_away_from_the_bad_proxy,
         test_preferred_proxy_gets_one_half_open_trial_after_its_cooldown,
+        test_a_failed_attempt_steers_the_next_one_to_another_proxy_for_a_while,
+        test_the_skip_is_logged_with_its_real_reason,
     )
     for test in tests:
         test()
